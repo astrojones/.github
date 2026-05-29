@@ -1,0 +1,67 @@
+name: nuk-apply
+
+# Reusable DEPLOY-ONLY workflow for nuklaut.
+#
+# For apps whose images are already built + pushed to GHCR by their own CI
+# (multi-image stacks like kolbe: ghcr.io/<owner>/<repo>/backend + /frontend).
+# Unlike nuk-deploy.yml it does NOT build — it checks out the caller (for the
+# manifest + compose file), logs into GHCR so the controller can pull private
+# images, then `nuk apply` + `nuk rollout` to bring the stack to the new images.
+#
+# Runs on the controller's persistent runner [self-hosted, nuklaut] where the
+# `nuk` CLI and /opt/nuklaut live.
+#
+# Caller (in the consumer repo):
+#   jobs:
+#     deploy:
+#       uses: astrojones/.github/.github/workflows/nuk-apply.yml@main
+#       secrets: inherit
+#       with:
+#         manifest: .nuklaut/deployment.yml   # optional (this is the default)
+
+on:
+  workflow_call:
+    inputs:
+      manifest:
+        description: Path to the nuk manifest in the caller repo
+        type: string
+        required: false
+        default: .nuklaut/deployment.yml
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, nuklaut]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify manifest exists
+        run: |
+          test -f "${{ inputs.manifest }}" \
+            || { echo "::error::manifest ${{ inputs.manifest }} not found in repo"; exit 1; }
+
+      # Log in AS the deploy user: nuk runs as `sudo -u deploy`, and this workflow
+      # does not build images locally (the caller's CI already pushed them), so the
+      # deploy user must hold the GHCR creds to `docker compose pull` private images.
+      - name: GHCR login (deploy user)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo -u deploy docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # apply: create/update state + Traefik dynamic file + edge-network override,
+      # then `docker compose up -d` (pulls any missing images on first deploy).
+      - name: nuk apply
+        run: |
+          sudo -u deploy /usr/local/bin/nuk apply \
+            --repo-path "$GITHUB_WORKSPACE" \
+            "${{ inputs.manifest }}"
+
+      # rollout: `docker compose pull` + `up -d` so an updated :latest is actually
+      # fetched (apply's up -d alone reuses a cached :latest).
+      - name: nuk rollout
+        run: |
+          name="$(python3 -c "import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))['metadata']['name'])" "${{ inputs.manifest }}")"
+          sudo -u deploy /usr/local/bin/nuk rollout "$name"
+
+      - name: Show deployment state
+        run: sudo -u deploy /usr/local/bin/nuk list
