@@ -1,0 +1,6 @@
+# Custom self-hosted runner labels used by the nuklaut controller's persistent
+# runner. Without this, actionlint flags `runs-on: [self-hosted, nuklaut]` as an
+# unknown label.
+self-hosted-runner:
+  labels:
+    - nuklaut

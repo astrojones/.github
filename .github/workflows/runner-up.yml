@@ -1,0 +1,164 @@
+name: runner-up
+
+# Reusable workflow: provision a one-shot ephemeral Hetzner runner and expose its
+# unique label so the caller can target it. Mints a 1-hour org registration token
+# (PAT stays in CI) and bakes ONLY that token into the cloud-init user-data.
+#
+# Call it as the `up` job, then run your work on `[self-hosted, <label>]`, then
+# call runner-down.yml with `if: always()`. See examples/consumer-e2e.yml.
+on:
+  workflow_call:
+    inputs:
+      org:
+        description: GitHub org to register the runner under
+        type: string
+        default: astrojones
+      server_type:
+        description: Hetzner server type (cpx32 = 4 vCPU / 8 GB / 160 GB)
+        type: string
+        default: cpx32
+      location:
+        description: Hetzner location
+        type: string
+        default: fsn1
+      image:
+        description: Hetzner OS image
+        type: string
+        default: debian-13
+      runner_image:
+        description: Pinned runner image (bump ~monthly; see README)
+        type: string
+        default: myoung34/github-runner:2.334.0
+      ssh_key:
+        description: Hetzner SSH key name for debug access (empty to omit)
+        type: string
+        default: astrojones-deploy
+      firewall:
+        description: Hetzner Cloud Firewall name to attach (empty to omit)
+        type: string
+        default: ""
+      cache_volume:
+        description: Hetzner volume name for a Docker-layer cache (empty = no cache). Single-attach => serialize runs that use it.
+        type: string
+        default: ""
+      cache_volume_size:
+        description: Size (GB) of the cache volume if it must be created
+        type: number
+        default: 50
+      template_ref:
+        description: Ref of <org>/.github to read the cloud-init template from
+        type: string
+        default: main
+      wait_for_runner:
+        description: Block until the runner registers (fail fast on boot errors)
+        type: boolean
+        default: true
+    outputs:
+      label:
+        description: Unique runner label to target with runs-on
+        value: ${{ jobs.up.outputs.label }}
+      server:
+        description: Hetzner server name (pass to runner-down.yml)
+        value: ${{ jobs.up.outputs.server }}
+      ipv4:
+        description: Public IPv4 of the runner (debug)
+        value: ${{ jobs.up.outputs.ipv4 }}
+    secrets:
+      HCLOUD_TOKEN:
+        description: Hetzner Cloud API token
+        required: true
+      RUNNER_PAT:
+        description: 'Fine-grained PAT, org "Self-hosted runners: Read and write", owner must be org owner (classic alt admin:org)'
+        required: true
+
+jobs:
+  up:
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.meta.outputs.label }}
+      server: ${{ steps.meta.outputs.server }}
+      ipv4: ${{ steps.create.outputs.ipv4 }}
+    steps:
+      - name: Checkout cloud-init template from ${{ inputs.org }}/.github
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.org }}/.github
+          ref: ${{ inputs.template_ref }}
+
+      - name: Install hcloud CLI
+        uses: hetznercloud/setup-hcloud@v2
+
+      - name: Ensure envsubst
+        run: command -v envsubst >/dev/null || { sudo apt-get update && sudo apt-get install -y gettext-base; }
+
+      - name: Compute names
+        id: meta
+        run: |
+          echo "label=run-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+          echo "server=eph-runner-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint registration token
+        id: token
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_PAT }}
+        run: |
+          TOKEN="$(gh api -X POST "/orgs/${{ inputs.org }}/actions/runners/registration-token" --jq .token)"
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure cache volume
+        id: volume
+        if: inputs.cache_volume != ''
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          NAME="${{ inputs.cache_volume }}"
+          if ! hcloud volume describe "$NAME" >/dev/null 2>&1; then
+            hcloud volume create --name "$NAME" --size ${{ inputs.cache_volume_size }} --location "${{ inputs.location }}" --format ext4
+          fi
+          echo "volume_id=$(hcloud volume describe "$NAME" -o json | jq -r .id)" >> "$GITHUB_OUTPUT"
+
+      - name: Render user-data and create server
+        id: create
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          ORG_NAME: ${{ inputs.org }}
+          RUNNER_TOKEN: ${{ steps.token.outputs.token }}
+          LABELS: ephemeral,${{ steps.meta.outputs.label }}
+          RUNNER_IMAGE: ${{ inputs.runner_image }}
+          RUNNER_WORKDIR: /tmp/github-runner-astrojones
+          VOLUME_ID: ${{ steps.volume.outputs.volume_id }}
+        run: |
+          envsubst '$ORG_NAME $RUNNER_TOKEN $LABELS $RUNNER_IMAGE $RUNNER_WORKDIR $VOLUME_ID' \
+            < cloud-init/runner.cloud-init.tpl.yaml > user-data.yaml
+          test "$(head -1 user-data.yaml)" = "#cloud-config" || { echo "rendered user-data missing #cloud-config header"; exit 1; }
+
+          SSH_FLAG=""; [ -n "${{ inputs.ssh_key }}" ]     && SSH_FLAG="--ssh-key ${{ inputs.ssh_key }}"
+          FW_FLAG="";  [ -n "${{ inputs.firewall }}" ]    && FW_FLAG="--firewall ${{ inputs.firewall }}"
+          VOL_FLAG=""; [ -n "${{ inputs.cache_volume }}" ] && VOL_FLAG="--volume ${{ inputs.cache_volume }}"
+
+          hcloud server create \
+            --name "${{ steps.meta.outputs.server }}" \
+            --type "${{ inputs.server_type }}" \
+            --image "${{ inputs.image }}" \
+            --location "${{ inputs.location }}" \
+            $SSH_FLAG $FW_FLAG $VOL_FLAG \
+            --label role=gha-runner --label org="${{ inputs.org }}" --label gh_run="${{ github.run_id }}" \
+            --user-data-from-file - < user-data.yaml
+
+          echo "ipv4=$(hcloud server describe "${{ steps.meta.outputs.server }}" -o json | jq -r '.public_net.ipv4.ip')" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for runner to register
+        if: inputs.wait_for_runner
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_PAT }}
+        run: |
+          LABEL="${{ steps.meta.outputs.label }}"
+          for i in $(seq 1 40); do
+            if gh api --paginate "/orgs/${{ inputs.org }}/actions/runners" --jq '.runners[]?.labels[]?.name' | grep -qx "$LABEL"; then
+              echo "runner $LABEL registered"; exit 0
+            fi
+            echo "waiting for runner $LABEL to register ($i/40)..."; sleep 10
+          done
+          echo "runner $LABEL did not register within ~6.5min (check cloud-init on the box)" >&2
+          exit 1

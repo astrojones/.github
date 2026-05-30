@@ -1,0 +1,43 @@
+name: runner-sweep
+
+# Safety net: hourly deletion of orphaned ephemeral runner servers (label
+# role=gha-runner) older than max_age_minutes. Catches the rare leak where a run
+# is cancelled hard before its `down` job executes. Lives in <org>/.github and
+# runs from its default branch.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      max_age_minutes:
+        description: Delete gha-runner servers older than this many minutes
+        type: number
+        default: 120
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install hcloud CLI
+        uses: hetznercloud/setup-hcloud@v2
+
+      - name: Delete orphaned ephemeral runners
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          MAX_AGE: ${{ github.event.inputs.max_age_minutes || 120 }}
+        run: |
+          MAX_SECONDS=$(( MAX_AGE * 60 ))
+          # Hetzner `created` is RFC3339 with a +00:00 offset and sometimes
+          # fractional seconds; jq's fromdateiso8601 only accepts ...Z form, so
+          # normalize first. try/catch so one odd row can't abort the whole sweep.
+          ORPHANS="$(hcloud server list -l role=gha-runner -o json \
+            | jq -r --argjson max "$MAX_SECONDS" '
+                .[]
+                | select((try (.created | sub("\\.[0-9]+";"") | sub("\\+00:00$";"Z") | fromdateiso8601) catch null) as $t
+                         | $t != null and (now - $t) > $max)
+                | .name')"
+          if [ -z "$ORPHANS" ]; then echo "no orphaned gha-runner servers"; exit 0; fi
+          echo "$ORPHANS" | while read -r s; do
+            echo "deleting orphan $s"
+            hcloud server delete "$s" || true
+          done

@@ -1,0 +1,182 @@
+name: migration-shadow-check
+
+# Reusable PRE-DEPLOY safety gate for nuklaut apps with alembic migrations.
+#
+# nuk apply runs `alembic upgrade head` BLIND against the live DB. CI's normal
+# migration check runs against an EMPTY postgres, so a migration that only loses
+# data on real, prod-shaped rows (e.g. a CASCADE delete, a UNIQUE index that
+# collides with legitimate old rows) passes CI and then destroys data on deploy.
+# This gate reproduces that risk safely: snapshot the LIVE controller postgres
+# into a throwaway DB, run the candidate image's migrations against the snapshot,
+# and FAIL if any critical table loses rows or an orphan-FK check trips.
+#
+# Ported from kolbe's scripts/migration-prod-shadow.sh, but runs the migration
+# from the CANDIDATE IMAGE (the exact artifact that will deploy) instead of a
+# repo checkout, and isolates the shadow DB on a throwaway docker network.
+#
+# Runs on the controller's persistent runner [self-hosted, nuklaut] because it
+# needs the live postgres container + the shared docker daemon. The snapshot
+# (which may contain PII) lives only inside the ephemeral DB and is dropped on
+# exit; nothing is written to the workspace.
+#
+# Caller:
+#   jobs:
+#     shadow:
+#       uses: astrojones/.github/.github/workflows/migration-shadow-check.yml@main
+#       secrets: inherit
+#       with:
+#         prod_postgres_container: kolbe-postgres-1
+#         backend_image: ghcr.io/astrojones/kolbe/backend
+#         backend_tag: ${{ github.sha }}
+#         critical_tables: "assessments students users catalog_versions classes competencies"
+#         orphan_check_sql: >-
+#           SELECT count(*) FROM assessments a
+#           LEFT JOIN students s ON a.student_id = s.id WHERE s.id IS NULL
+
+on:
+  workflow_call:
+    inputs:
+      prod_postgres_container:
+        description: Name of the LIVE postgres container on the controller (e.g. kolbe-postgres-1).
+        type: string
+        required: true
+      backend_image:
+        description: GHCR ref (no tag) of the image that owns the migrations.
+        type: string
+        required: true
+      backend_tag:
+        description: Tag of the candidate image whose migrations are being validated (usually the sha).
+        type: string
+        required: true
+      critical_tables:
+        description: Space-separated tables whose row count must NOT decrease after migrating.
+        type: string
+        required: true
+      app_db:
+        description: Database name to snapshot/migrate.
+        type: string
+        required: false
+        default: app
+      db_user:
+        description: Postgres superuser in the containers.
+        type: string
+        required: false
+        default: postgres
+      migrate_cmd:
+        description: Migration command run inside the candidate image.
+        type: string
+        required: false
+        default: alembic upgrade head
+      orphan_check_sql:
+        description: Optional SQL returning a single count of orphaned rows; >0 fails the gate.
+        type: string
+        required: false
+        default: ''
+
+jobs:
+  shadow:
+    runs-on: [self-hosted, nuklaut]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR and pull the candidate image
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "${{ inputs.backend_image }}:${{ inputs.backend_tag }}"
+
+      - name: Shadow-migrate a snapshot of live prod data
+        env:
+          PROD_PG: ${{ inputs.prod_postgres_container }}
+          APP_DB: ${{ inputs.app_db }}
+          DB_USER: ${{ inputs.db_user }}
+          IMAGE: ${{ inputs.backend_image }}:${{ inputs.backend_tag }}
+          MIGRATE_CMD: ${{ inputs.migrate_cmd }}
+          CRITICAL_TABLES: ${{ inputs.critical_tables }}
+          ORPHAN_SQL: ${{ inputs.orphan_check_sql }}
+        run: |
+          set -euo pipefail
+
+          # Split the space-separated inputs into arrays (CRITICAL_TABLES -> table
+          # names, MIGRATE_CMD -> command + args) so they expand without SC2086.
+          read -ra TABLES <<< "${CRITICAL_TABLES}" || true
+          read -ra MCMD <<< "${MIGRATE_CMD}" || true
+
+          RUN_ID="${GITHUB_RUN_ID:-local}"
+          NET="shadow-net-${RUN_ID}"
+          PG="shadow-pg-${RUN_ID}"
+          TMP="$(mktemp -d)"
+
+          cleanup() {
+            docker rm -f "${PG}" >/dev/null 2>&1 || true
+            docker network rm "${NET}" >/dev/null 2>&1 || true
+            rm -rf "${TMP}"
+          }
+          trap cleanup EXIT
+
+          # Prod container must exist (read-only source).
+          if ! docker inspect "${PROD_PG}" >/dev/null 2>&1; then
+            echo "::error::prod postgres container '${PROD_PG}' not found on the controller"
+            exit 1
+          fi
+
+          echo "Creating throwaway network + ephemeral postgres..."
+          docker network create "${NET}" >/dev/null
+          docker run -d --name "${PG}" --network "${NET}" \
+            -e POSTGRES_PASSWORD=shadow -e POSTGRES_DB="${APP_DB}" \
+            postgres:16-alpine >/dev/null
+          for _ in $(seq 1 30); do
+            docker exec "${PG}" pg_isready -U postgres >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+          echo "Snapshotting live data from ${PROD_PG} (pg_dump -Fc)..."
+          docker exec "${PROD_PG}" pg_dump -U "${DB_USER}" -Fc "${APP_DB}" > "${TMP}/prod.dump"
+
+          echo "Restoring snapshot into the ephemeral postgres..."
+          docker cp "${TMP}/prod.dump" "${PG}:/tmp/prod.dump"
+          docker exec "${PG}" pg_restore -U postgres -d "${APP_DB}" \
+            --clean --if-exists --no-owner --no-privileges /tmp/prod.dump
+          docker exec "${PG}" rm -f /tmp/prod.dump
+
+          echo "Pre-migration row counts:"
+          declare -A PRE
+          for t in "${TABLES[@]}"; do
+            c=$(docker exec "${PG}" psql -U postgres -d "${APP_DB}" -t -A \
+              -c "SELECT count(*) FROM ${t}" 2>/dev/null | tr -d '[:space:]' || echo 0)
+            PRE[$t]="${c:-0}"
+            echo "  pre:  ${t} = ${PRE[$t]}"
+          done
+
+          echo "Running '${MIGRATE_CMD}' from ${IMAGE} against the snapshot..."
+          docker run --rm --network "${NET}" \
+            -e DATABASE_URL="postgresql+asyncpg://postgres:shadow@${PG}:5432/${APP_DB}" \
+            "${IMAGE}" "${MCMD[@]}"
+
+          echo "Post-migration integrity checks:"
+          FAILED=false
+          for t in "${TABLES[@]}"; do
+            post=$(docker exec "${PG}" psql -U postgres -d "${APP_DB}" -t -A \
+              -c "SELECT count(*) FROM ${t}" 2>/dev/null | tr -d '[:space:]' || echo 0)
+            if [ "${post:-0}" -lt "${PRE[$t]}" ]; then
+              echo "::error::${t}: ${PRE[$t]} -> ${post} (LOST $(( PRE[$t] - post )) rows)"
+              FAILED=true
+            else
+              echo "  post: ${t} = ${post} (OK)"
+            fi
+          done
+
+          if [ -n "${ORPHAN_SQL}" ]; then
+            orphaned=$(docker exec "${PG}" psql -U postgres -d "${APP_DB}" -t -A \
+              -c "${ORPHAN_SQL}" 2>/dev/null | tr -d '[:space:]' || echo 0)
+            if [ "${orphaned:-0}" -gt 0 ]; then
+              echo "::error::${orphaned} orphaned rows (FK integrity broken by migration)"
+              FAILED=true
+            fi
+          fi
+
+          if [ "${FAILED}" = true ]; then
+            echo "::error::Shadow-migration integrity check FAILED — this migration would lose data on prod."
+            exit 1
+          fi
+          echo "PASS: pending migrations apply to a live-data snapshot with no row loss."

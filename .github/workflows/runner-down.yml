@@ -1,0 +1,36 @@
+name: runner-down
+
+# Reusable workflow: delete an ephemeral Hetzner runner created by runner-up.yml.
+# Idempotent (tolerates an already-deleted server). Any attached cache volume is
+# auto-detached by Hetzner and PRESERVED. Always call this with `if: always()`.
+on:
+  workflow_call:
+    inputs:
+      server:
+        description: Hetzner server name from runner-up.yml's `server` output
+        type: string
+        required: true
+    secrets:
+      HCLOUD_TOKEN:
+        description: Hetzner Cloud API token
+        required: true
+
+jobs:
+  down:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install hcloud CLI
+        uses: hetznercloud/setup-hcloud@v2
+
+      - name: Delete server (idempotent)
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          SERVER="${{ inputs.server }}"
+          if [ -z "$SERVER" ]; then echo "no server name supplied; nothing to delete"; exit 0; fi
+          if hcloud server describe "$SERVER" >/dev/null 2>&1; then
+            hcloud server delete "$SERVER"
+            echo "deleted $SERVER (any attached cache volume was auto-detached and preserved)"
+          else
+            echo "$SERVER already gone"
+          fi

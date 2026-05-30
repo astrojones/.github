@@ -1,0 +1,46 @@
+name: calver
+description: >-
+  Compute a CalVer YYYY.MM.N version from git tags. N is the next ordinal for the
+  current UTC month, derived from existing tags matching <tag_prefix>YYYY.MM.*.
+  PURE — reads tags only, never pushes. The caller (a build/release workflow) is
+  responsible for pushing the <tag_prefix><version> tag on success so the counter
+  stays monotonic. Requires the repo be checked out with fetch-depth: 0 and
+  fetch-tags: true (otherwise no tags are visible and N resets to 1).
+
+inputs:
+  tag_prefix:
+    description: Tag prefix that fronts the version (e.g. 'v' -> v2026.05.3).
+    required: false
+    default: v
+
+outputs:
+  version:
+    description: Computed YYYY.MM.N version (no prefix).
+    value: ${{ steps.calver.outputs.version }}
+  tag:
+    description: Full git tag for this version (<tag_prefix><version>).
+    value: ${{ steps.calver.outputs.tag }}
+  timestamp:
+    description: UTC build timestamp, ISO 8601.
+    value: ${{ steps.calver.outputs.timestamp }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute YYYY.MM.N
+      id: calver
+      shell: bash
+      env:
+        TAG_PREFIX: ${{ inputs.tag_prefix }}
+      run: |
+        YEAR_MONTH=$(date -u +%Y.%m)
+        # Highest N already tagged for this month (empty if none / tags not fetched).
+        HIGHEST=$(git tag -l "${TAG_PREFIX}${YEAR_MONTH}.*" | sed "s/${TAG_PREFIX}${YEAR_MONTH}\.//" | sort -n | tail -1)
+        if [ -z "$HIGHEST" ]; then N=1; else N=$((HIGHEST + 1)); fi
+        VERSION="${YEAR_MONTH}.${N}"
+        {
+          echo "version=${VERSION}"
+          echo "tag=${TAG_PREFIX}${VERSION}"
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } >> "$GITHUB_OUTPUT"
+        echo "Computed version: ${VERSION} (tag ${TAG_PREFIX}${VERSION})"

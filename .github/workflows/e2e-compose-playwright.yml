@@ -1,0 +1,455 @@
+name: e2e-compose-playwright
+
+# Reusable E2E workflow for nuklaut apps.
+#
+# Stands up an ephemeral Docker Compose app stack and runs a sharded Playwright
+# suite against it, ON A FRESH SINGLE-TENANT EPHEMERAL HETZNER BOX provided by
+# the caller's runner-up.yml job. The compose fixture (docker-compose.e2e.yml)
+# and Playwright config STAY in the consumer repo — this workflow just runs them.
+#
+# WHY ONE JOB: the box is fresh and dedicated to this run, so every concern
+# (the running compose stack, node_modules, the Playwright browser binaries,
+# host-published ports) shares one filesystem and one Docker daemon. Splitting
+# shards into separate matrix JOBS would make each a distinct GitHub job that
+# cannot see the others' running containers — forcing a stack bring-up per shard
+# or fragile cross-job host-state coupling. A single job (stack up -> journey
+# gate -> `--shard=i/N` loop -> merge -> teardown) is the simplest correct shape.
+#
+# Because the box is single-tenant we DROP the legacy collision hacks: static
+# ports (8001/5174) are fine, no COMPOSE_PROJECT_NAME=run_id namespacing, and no
+# gate self-cancel/sleep-60. The caller gates whether to invoke us at all.
+#
+# Caller wires it as the middle `build` job (see examples/consumer-e2e.yml):
+#   jobs:
+#     up:    { uses: astrojones/.github/.github/workflows/runner-up.yml@main, secrets: inherit }
+#     e2e:
+#       needs: up
+#       uses: astrojones/.github/.github/workflows/e2e-compose-playwright.yml@main
+#       secrets: inherit
+#       with:
+#         runner_label: ${{ needs.up.outputs.label }}
+#         backend_image: ghcr.io/astrojones/kolbe/backend
+#         frontend_image: ghcr.io/astrojones/kolbe/frontend
+#         seed_cmd: python -m kolbe_api.cli.seed_mock_users
+#     down:  { needs: [up, e2e], if: always(), uses: .../runner-down.yml@main, secrets: inherit, with: { server: ${{ needs.up.outputs.server }} } }
+
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: Unique ephemeral-runner label from runner-up.yml's `label` output (targets THIS box)
+        type: string
+        required: true
+      compose_file:
+        description: Compose fixture (repo-relative) defining the test stack
+        type: string
+        default: docker-compose.e2e.yml
+      backend_image:
+        description: Backend image GHCR ref WITHOUT tag (e.g. ghcr.io/astrojones/kolbe/backend)
+        type: string
+        required: true
+      frontend_image:
+        description: Frontend image GHCR ref WITHOUT tag (e.g. ghcr.io/astrojones/kolbe/frontend)
+        type: string
+        required: true
+      image_tag:
+        description: Tag to test; per-image manifest-inspect falls back to :latest when the SHA tag is absent
+        type: string
+        default: ${{ github.sha }}
+      migrate_cmd:
+        description: One-shot DB migration command, run in a backend container on the compose network
+        type: string
+        default: alembic upgrade head
+      seed_cmd:
+        description: Optional seed command, run via `docker exec` in the running backend container (empty = skip)
+        type: string
+        default: ''
+      health_url:
+        description: Backend health endpoint to poll on the host (host-published port)
+        type: string
+        default: http://localhost:8001/health
+      base_url:
+        description: BASE_URL Playwright targets — the host-published proxy/frontend port
+        type: string
+        default: http://localhost:5174
+      test_dir:
+        description: Repo-relative dir holding package.json + playwright.config (pnpm workspace root for the suite)
+        type: string
+        default: frontend
+      shard_count:
+        description: Number of Playwright `--shard` slices to run sequentially on this box
+        type: number
+        default: 5
+      journey_project:
+        description: Playwright project name for the critical-path gate (runs first, fail-fast)
+        type: string
+        default: journey
+      stories_project:
+        description: Playwright project name for the sharded story suite
+        type: string
+        default: stories
+      test_grep:
+        description: Optional Playwright --grep regex to filter tests
+        type: string
+        default: ''
+    outputs:
+      passed:
+        description: 'true when stats.unexpected == 0 across all shards'
+        value: ${{ jobs.e2e.outputs.passed }}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  e2e:
+    # Runs on the fresh single-tenant box from runner-up.yml. Dashed block form —
+    # the inline [self-hosted, "${{...}}"] shape is known to misparse (see
+    # examples/consumer-e2e.yml). `self-hosted` is implicit; the label pins THIS box.
+    runs-on:
+      - self-hosted
+      - ${{ inputs.runner_label }}
+    timeout-minutes: 45
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+    env:
+      BACKEND_IMAGE: ${{ inputs.backend_image }}
+      FRONTEND_IMAGE: ${{ inputs.frontend_image }}
+      COMPOSE_FILE: ${{ inputs.compose_file }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve per-image tags (manifest-inspect, else latest)
+        id: tags
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          # Need a GHCR login for `docker manifest inspect` on private images.
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          resolve() {
+            local ref="$1"
+            if docker manifest inspect "${ref}:${IMAGE_TAG}" >/dev/null 2>&1; then
+              echo "$IMAGE_TAG"
+            else
+              echo "latest"
+            fi
+          }
+          BACKEND_TAG="$(resolve "$BACKEND_IMAGE")"
+          FRONTEND_TAG="$(resolve "$FRONTEND_IMAGE")"
+          echo "backend_tag=${BACKEND_TAG}" >> "$GITHUB_OUTPUT"
+          echo "frontend_tag=${FRONTEND_TAG}" >> "$GITHUB_OUTPUT"
+          echo "backend ${BACKEND_IMAGE}:${BACKEND_TAG} / frontend ${FRONTEND_IMAGE}:${FRONTEND_TAG}"
+
+      - name: Pull images
+        env:
+          BACKEND_TAG: ${{ steps.tags.outputs.backend_tag }}
+          FRONTEND_TAG: ${{ steps.tags.outputs.frontend_tag }}
+        run: |
+          docker pull "${BACKEND_IMAGE}:${BACKEND_TAG}"
+          docker pull "${FRONTEND_IMAGE}:${FRONTEND_TAG}"
+
+      - name: Start datastores (postgres + redis, wait for healthy)
+        env:
+          BACKEND_TAG: ${{ steps.tags.outputs.backend_tag }}
+          FRONTEND_TAG: ${{ steps.tags.outputs.frontend_tag }}
+        run: |
+          docker compose -f "$COMPOSE_FILE" up -d --wait postgres redis
+
+      - name: Run migrations (one-shot on the compose network)
+        # Run before the backend boots — apps that query config on startup need a
+        # migrated schema. A throwaway backend container joins the compose network
+        # so it reaches `postgres` by service hostname, mirroring the live env.
+        env:
+          BACKEND_TAG: ${{ steps.tags.outputs.backend_tag }}
+          MIGRATE_CMD: ${{ inputs.migrate_cmd }}
+        run: |
+          PG_CID="$(docker compose -f "$COMPOSE_FILE" ps -q postgres)"
+          if [ -z "$PG_CID" ]; then echo "::error::postgres container not found"; exit 1; fi
+          # First attached network name, via jq (avoids Go-template $-vars that
+          # the linter would flag as non-expanding shell, SC2016).
+          NETWORK="$(docker inspect "$PG_CID" \
+            | jq -r '.[0].NetworkSettings.Networks | keys[0]')"
+          if [ -z "$NETWORK" ] || [ "$NETWORK" = "null" ]; then echo "::error::could not resolve compose network"; exit 1; fi
+          read -ra MIGRATE <<< "$MIGRATE_CMD"
+          docker run --rm \
+            --network "$NETWORK" \
+            -e DATABASE_URL=postgresql+asyncpg://postgres:e2e-test-password@postgres:5432/app \
+            -e SECRET_KEY=e2e-secret-key-minimum-32-characters-for-testing-only \
+            -e AUTH_PROVIDER=password \
+            "${BACKEND_IMAGE}:${BACKEND_TAG}" \
+            "${MIGRATE[@]}"
+
+      - name: Start app (backend + frontend + proxy)
+        env:
+          BACKEND_TAG: ${{ steps.tags.outputs.backend_tag }}
+          FRONTEND_TAG: ${{ steps.tags.outputs.frontend_tag }}
+        run: |
+          docker compose -f "$COMPOSE_FILE" up -d backend frontend proxy
+
+      - name: Wait for backend health
+        env:
+          HEALTH_URL: ${{ inputs.health_url }}
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf "$HEALTH_URL" >/dev/null 2>&1; then
+              echo "backend healthy"; exit 0
+            fi
+            echo "waiting for backend ($i/60)..."; sleep 3
+          done
+          echo "::error::backend unreachable at $HEALTH_URL after 180s"
+          docker compose -f "$COMPOSE_FILE" ps
+          docker compose -f "$COMPOSE_FILE" logs backend --tail=50
+          exit 1
+
+      - name: Seed mock data
+        if: ${{ inputs.seed_cmd != '' }}
+        env:
+          SEED_CMD: ${{ inputs.seed_cmd }}
+        run: |
+          BACKEND_CID="$(docker compose -f "$COMPOSE_FILE" ps -q backend)"
+          if [ -z "$BACKEND_CID" ]; then echo "::error::backend container not found for seed"; exit 1; fi
+          read -ra SEED <<< "$SEED_CMD"
+          docker exec "$BACKEND_CID" "${SEED[@]}"
+
+      - name: Wait for proxy / frontend
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf "$BASE_URL" >/dev/null 2>&1; then
+              echo "proxy healthy"; exit 0
+            fi
+            echo "waiting for proxy ($i/30)..."; sleep 3
+          done
+          echo "::error::proxy/frontend unreachable at $BASE_URL after 90s"
+          docker compose -f "$COMPOSE_FILE" ps
+          docker compose -f "$COMPOSE_FILE" logs proxy --tail=50
+          exit 1
+
+      # Playwright runs in HOST context (NOT inside a container) so BASE_URL=
+      # localhost:<port> reaches the host-published compose ports.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm deps
+        working-directory: ${{ inputs.test_dir }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright chromium
+        working-directory: ${{ inputs.test_dir }}
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Phase 1: journey gate (critical path, fail-fast). If this fails the whole
+      # job fails before we spend time on the story shards.
+      - name: Journey gate
+        working-directory: ${{ inputs.test_dir }}
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+          CI: 'true'
+          PLAYWRIGHT_IGNORE_CERTIFICATE_ERRORS: 'true'
+          JOURNEY_PROJECT: ${{ inputs.journey_project }}
+          TEST_GREP: ${{ inputs.test_grep }}
+        run: |
+          ARGS=(test --project="$JOURNEY_PROJECT")
+          [ -n "$TEST_GREP" ] && ARGS+=(--grep "$TEST_GREP")
+          pnpm exec playwright "${ARGS[@]}"
+
+      # Phase 2: story shards. Playwright's native --shard=i/N splits the suite
+      # deterministically at the test level — no hand-maintained file lists (the
+      # legacy's latent coverage gap: any new test file not added to a shard list
+      # silently never ran). Sequential on one box; workers:1 in the suite's CI
+      # config keeps each shard single-worker against the shared stack.
+      # SKIP_GLOBAL_TEARDOWN keeps the stack alive between shards; we tear down
+      # explicitly below. Each shard writes a uniquely-named JSON for the merge.
+      - name: Run story shards
+        id: shards
+        working-directory: ${{ inputs.test_dir }}
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+          CI: 'true'
+          PLAYWRIGHT_IGNORE_CERTIFICATE_ERRORS: 'true'
+          SKIP_GLOBAL_TEARDOWN: 'true'
+          STORIES_PROJECT: ${{ inputs.stories_project }}
+          SHARD_COUNT: ${{ inputs.shard_count }}
+          TEST_GREP: ${{ inputs.test_grep }}
+        run: |
+          mkdir -p shard-results
+          FAILED=0
+          for i in $(seq 1 "$SHARD_COUNT"); do
+            echo "::group::shard ${i}/${SHARD_COUNT}"
+            ARGS=(test --project="$STORIES_PROJECT" --shard="${i}/${SHARD_COUNT}")
+            [ -n "$TEST_GREP" ] && ARGS+=(--grep "$TEST_GREP")
+            # Redirect the json reporter per-shard so shards don't clobber each other.
+            if PLAYWRIGHT_JSON_OUTPUT_NAME="shard-results/shard-${i}.json" \
+                 pnpm exec playwright "${ARGS[@]}"; then
+              echo "shard ${i} passed"
+            else
+              echo "shard ${i} reported failures"
+              FAILED=1
+            fi
+            echo "::endgroup::"
+          done
+          # Don't fail the step here — the merge/check step is the single source of
+          # truth (and we still want teardown + artifact upload to run).
+          echo "any_failed=${FAILED}" >> "$GITHUB_OUTPUT"
+
+      - name: Merge shard results
+        if: always()
+        working-directory: ${{ inputs.test_dir }}
+        run: |
+          python3 <<'PYTHON'
+          import json
+          import re
+          from pathlib import Path
+
+          _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+          def strip_ansi(text):
+              return _ANSI_RE.sub('', text)
+
+          def collect_tests(suites, file_path=""):
+              """Recursively collect all test results from a Playwright JSON report."""
+              tests = []
+              for suite in suites:
+                  fp = suite.get("file", file_path)
+                  for spec in suite.get("specs", []):
+                      for test in spec.get("tests", []):
+                          status = test.get("status", "unknown")
+                          error = ""
+                          if status in ("unexpected", "flaky"):
+                              for result in test.get("results", []):
+                                  if result.get("status") in ("failed", "timedOut"):
+                                      err = result.get("error", {})
+                                      error = strip_ansi(err.get("message", ""))[:500]
+                          tests.append({
+                              "file": fp.split("/")[-1] if "/" in fp else fp,
+                              "title": " > ".join(spec.get("titlePath", [spec.get("title", "?")])),
+                              "status": status,
+                              "error": error,
+                          })
+                  tests.extend(collect_tests(suite.get("suites", []), fp))
+              return tests
+
+          results_dir = Path("shard-results")
+          all_results = []
+          all_tests = []
+          for shard_file in sorted(results_dir.glob("shard-*.json")):
+              try:
+                  with open(shard_file) as f:
+                      data = json.load(f)
+              except (OSError, json.JSONDecodeError):
+                  continue
+              all_results.append(data)
+              all_tests.extend(collect_tests(data.get("suites", [])))
+
+          if not all_results:
+              print("No shard results found")
+              raise SystemExit(1)
+
+          total_stats = {
+              "expected": sum(r.get("stats", {}).get("expected", 0) for r in all_results),
+              "unexpected": sum(r.get("stats", {}).get("unexpected", 0) for r in all_results),
+              "flaky": sum(r.get("stats", {}).get("flaky", 0) for r in all_results),
+              "skipped": sum(r.get("stats", {}).get("skipped", 0) for r in all_results),
+          }
+
+          merged = {
+              "stats": total_stats,
+              "suites": [s for r in all_results for s in r.get("suites", [])],
+          }
+          with open("e2e-results.json", "w") as f:
+              json.dump(merged, f, indent=2)
+
+          lines = []
+          total = sum(total_stats.values())
+          icon = "PASS" if total_stats["unexpected"] == 0 else "FAIL"
+          lines.append(f"# E2E Results [{icon}]: {total_stats['expected']}/{total} passed")
+          lines.append("")
+          lines.append(f"- Passed: {total_stats['expected']}")
+          lines.append(f"- Failed: {total_stats['unexpected']}")
+          if total_stats["flaky"]:
+              lines.append(f"- Flaky: {total_stats['flaky']}")
+          if total_stats["skipped"]:
+              lines.append(f"- Skipped: {total_stats['skipped']}")
+          lines.append("")
+
+          failed = [t for t in all_tests if t["status"] == "unexpected"]
+          if failed:
+              lines.append("## Failed Tests")
+              lines.append("")
+              for t in failed:
+                  lines.append(f"**{t['file']}** -> {t['title']}")
+                  if t["error"]:
+                      lines.append("```")
+                      lines.append(t["error"])
+                      lines.append("```")
+                  lines.append("")
+
+          flaky = [t for t in all_tests if t["status"] == "flaky"]
+          if flaky:
+              lines.append("## Flaky Tests (passed on retry)")
+              lines.append("")
+              for t in flaky:
+                  lines.append(f"- **{t['file']}** -> {t['title']}")
+              lines.append("")
+
+          with open("e2e-summary.md", "w") as f:
+              f.write("\n".join(lines))
+
+          print(f"Merged {len(all_results)} shard results: {total_stats}")
+          for t in failed:
+              print(f"  FAIL {t['file']} -> {t['title']}")
+          PYTHON
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+
+      - name: Check for failures
+        id: check
+        if: always()
+        working-directory: ${{ inputs.test_dir }}
+        run: |
+          if [ ! -f e2e-results.json ]; then
+            echo "::error::no merged results file"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          UNEXPECTED="$(jq '.stats.unexpected' e2e-results.json)"
+          FLAKY="$(jq '.stats.flaky' e2e-results.json)"
+          if [ "$UNEXPECTED" -gt 0 ]; then
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::$UNEXPECTED hard test failure(s)"
+            exit 1
+          fi
+          if [ "$FLAKY" -gt 0 ]; then
+            echo "::warning::$FLAKY flaky test(s) passed on retry — not blocking"
+          fi
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+          echo "all tests passed (flaky: $FLAKY)"
+
+      - name: Write job summary
+        if: always()
+        working-directory: ${{ inputs.test_dir }}
+        run: |
+          if [ -f e2e-summary.md ]; then
+            cat e2e-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No E2E summary generated" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: |
+            ${{ inputs.test_dir }}/e2e-results.json
+            ${{ inputs.test_dir }}/e2e-summary.md
+            ${{ inputs.test_dir }}/shard-results/
+          if-no-files-found: ignore
+          retention-days: 7

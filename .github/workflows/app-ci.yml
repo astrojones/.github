@@ -37,6 +37,16 @@ on:
         type: boolean
         required: false
         default: true
+      tag_latest:
+        description: Also tag :latest (set false for PR/preview builds so they don't clobber main's :latest)
+        type: boolean
+        required: false
+        default: true
+      extra_tags:
+        description: Newline-separated bare tags to add to every image (e.g. pr-42, 2026.05.3). :<sha> is always pushed.
+        type: string
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -69,15 +79,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Assemble the tag list: :<sha> always, :latest unless tag_latest=false,
+      # plus any caller-supplied bare tags (one per line) e.g. pr-N / CalVer.
+      - name: Assemble tags
+        id: tags
+        env:
+          REF: ${{ steps.img.outputs.ref }}
+          SHA: ${{ github.sha }}
+          TAG_LATEST: ${{ inputs.tag_latest }}
+          EXTRA: ${{ inputs.extra_tags }}
+        run: |
+          {
+            echo "list<<EOF"
+            echo "${REF}:${SHA}"
+            [ "${TAG_LATEST}" = "true" ] && echo "${REF}:latest"
+            while IFS= read -r t; do
+              [ -n "$t" ] && echo "${REF}:${t}"
+            done <<< "${EXTRA}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and push ${{ matrix.image.name }}
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.dockerfile || format('{0}/Dockerfile', matrix.image.context) }}
           push: ${{ inputs.push }}
-          tags: |
-            ${{ steps.img.outputs.ref }}:${{ github.sha }}
-            ${{ steps.img.outputs.ref }}:latest
+          tags: ${{ steps.tags.outputs.list }}
           build-args: ${{ matrix.image.build_args }}
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}

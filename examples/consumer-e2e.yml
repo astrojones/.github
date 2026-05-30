@@ -1,0 +1,47 @@
+# EXAMPLE consumer workflow.
+#
+# Copy into a CONSUMER repo (e.g. astrojones/kolbe) as .github/workflows/e2e.yml.
+# It spins up a one-shot ephemeral Hetzner runner, runs work on it, and tears it
+# down even on failure. Requires org-level Actions secrets HCLOUD_TOKEN and
+# RUNNER_PAT (forwarded via `secrets: inherit`). See the astrojones/.github README.
+#
+# The three-job shape is mandatory: a reusable-workflow `uses:` job cannot host
+# `steps:`, so the consumer owns the middle `build` job that runs on the runner.
+name: e2e
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  up:
+    uses: astrojones/.github/.github/workflows/runner-up.yml@main
+    secrets: inherit
+    with:
+      server_type: cpx32
+      location: fsn1
+      # cache_volume: e2e-playwright-cache   # opt-in; single-attach => serialize
+
+  build:
+    needs: up
+    # Dashed block-sequence form — the inline [self-hosted, "${{...}}"] form is
+    # known to misparse. self-hosted is auto-applied; the unique label pins THIS box.
+    runs-on:
+      - self-hosted
+      - ${{ needs.up.outputs.label }}
+    timeout-minutes: 30
+    # Toolchain comes from a container; the runner exposes host Docker (DooD), so
+    # swap this image for your workload (texlive, mcr.../playwright, etc.).
+    container:
+      image: node:22-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --version && echo "running on ephemeral runner ${{ needs.up.outputs.label }}"
+
+  down:
+    needs: [up, build]
+    if: always()
+    uses: astrojones/.github/.github/workflows/runner-down.yml@main
+    secrets: inherit
+    with:
+      server: ${{ needs.up.outputs.server }}
