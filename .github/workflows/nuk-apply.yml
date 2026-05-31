@@ -57,8 +57,21 @@ jobs:
       - name: Pull images into the shared docker daemon
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker compose -f "${{ inputs.compose_file }}" config --images 2>/dev/null \
-            | sort -u | xargs -r -n1 docker pull
+          # Enumerate images straight from the compose FILE, NOT via
+          # `docker compose config --images`: that resolves each service's
+          # env_file:, so it fails for this runner user whenever a compose
+          # references a deploy-owned 0600 secret (e.g.
+          # /opt/nuklaut/secrets/<app>-db.env -> "permission denied"). The old
+          # `2>/dev/null | xargs -r` swallowed that error and pulled NOTHING, so
+          # the daemon kept a stale :latest and up -d ran old code. Parse the
+          # raw YAML instead (runner can always read the repo checkout).
+          images=$(grep -oE '^[[:space:]]*image:[[:space:]]*[^[:space:]#]+' "${{ inputs.compose_file }}" | awk '{print $2}' | sort -u)
+          if [ -z "$images" ]; then
+            echo "::warning::no image: entries in ${{ inputs.compose_file }} — nothing to pull"
+            exit 0
+          fi
+          echo "Pulling images:"; printf '  %s\n' $images
+          printf '%s\n' $images | xargs -n1 docker pull
 
       # apply: write state + Traefik dynamic file + edge override, then up -d.
       # Images are already in the daemon, so no pull happens as the deploy user.
