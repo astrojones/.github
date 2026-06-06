@@ -13,12 +13,10 @@ name: nuk-preview
 #   teardown — `nuk delete <app>-pr-<n>`, rewrite the sticky comment to Closed/Merged
 #   cleanup  — cron sweep: delete any `<app>-pr-*` whose PR is no longer OPEN
 #
-# GHCR auth model (copied verbatim from nuk-apply.yml): the controller `deploy`
-# user has NOPASSWD sudo ONLY for the nuk/install allowlist, NOT `docker login`,
-# so it cannot authenticate to GHCR. The RUNNER user (which runs docker directly)
-# logs in and `docker pull`s the pr-<n> images into the SHARED docker daemon;
-# `sudo -u deploy nuk apply` then runs `docker compose up -d` against images that
-# are already present — no deploy-user auth needed.
+# GHCR auth model (same as nuk-apply.yml): the in-container runner (runs as root,
+# with the host docker socket + /opt/nuklaut bind-mounted) logs in and `docker
+# pull`s the pr-<n> images into the SHARED docker daemon, then runs `nuk apply`
+# in-process — no sudo.
 #
 # TLS: the controller Traefik uses a dnsChallenge(hetzner) resolver, so the
 # wildcard cert for *.<base_host> covers pr-<n>.<base_host> automatically. nuk
@@ -156,13 +154,13 @@ jobs:
         run: |
           NAME="${APP}-pr-${PR}"
           # Names of other live previews for this app.
-          OTHERS="$(sudo -u deploy /usr/local/bin/nuk list \
+          OTHERS="$(/usr/local/bin/nuk list \
             | awk -v p="${APP}-pr-" -v self="$NAME" '$1 ~ "^"p && $1 != self {print $1}')"
           COUNT=0
           [ -n "$OTHERS" ] && COUNT=$(printf '%s\n' "$OTHERS" | grep -c .)
           # Is this PR already deployed? (re-deploy doesn't consume a new slot)
           EXISTS=false
-          if sudo -u deploy /usr/local/bin/nuk list | awk '{print $1}' | grep -qx "$NAME"; then
+          if /usr/local/bin/nuk list | awk '{print $1}' | grep -qx "$NAME"; then
             EXISTS=true
           fi
           AT_LIMIT=false
@@ -307,13 +305,13 @@ jobs:
         env:
           MANIFEST: ${{ steps.manifest.outputs.path }}
         run: |
-          sudo -u deploy /usr/local/bin/nuk apply \
+          /usr/local/bin/nuk apply \
             --repo-path "$GITHUB_WORKSPACE" \
             "$MANIFEST"
 
       - name: Show deployment state
         if: steps.cap.outputs.at_limit != 'true'
-        run: sudo -u deploy /usr/local/bin/nuk list
+        run: /usr/local/bin/nuk list
 
       # Sticky PR comment with the live URL + test creds (marker-delimited upsert).
       - name: Comment — preview URL
@@ -380,8 +378,8 @@ jobs:
         run: |
           NAME="${APP}-pr-${PR}"
           echo "Tearing down $NAME"
-          sudo -u deploy /usr/local/bin/nuk delete "$NAME"
-          sudo -u deploy /usr/local/bin/nuk list
+          /usr/local/bin/nuk delete "$NAME"
+          /usr/local/bin/nuk list
 
       - name: Comment — torn down
         if: inputs.comment
@@ -419,14 +417,14 @@ jobs:
         run: |
           [ -n "$APP" ] || { echo "::error::app is required for cleanup"; exit 1; }
           STALE=0
-          mapfile -t NAMES < <(sudo -u deploy /usr/local/bin/nuk list \
+          mapfile -t NAMES < <(/usr/local/bin/nuk list \
             | awk -v p="${APP}-pr-" '$1 ~ "^"p"[0-9]+$" {print $1}')
           for name in "${NAMES[@]}"; do
             PR_NUM="${name#"${APP}-pr-"}"
             STATE="$(gh pr view "$PR_NUM" --repo "$GH_REPO" --json state -q '.state' 2>/dev/null || echo UNKNOWN)"
             if [ "$STATE" != "OPEN" ]; then
               echo "PR #${PR_NUM} is ${STATE} — deleting stale preview ${name}"
-              sudo -u deploy /usr/local/bin/nuk delete "$name"
+              /usr/local/bin/nuk delete "$name"
               STALE=$((STALE + 1))
             else
               echo "PR #${PR_NUM} OPEN — keeping ${name}"

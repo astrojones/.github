@@ -6,12 +6,10 @@ name: nuk-apply
 # (multi-image stacks like kolbe: ghcr.io/<owner>/<repo>/backend + /frontend).
 # Unlike nuk-deploy.yml it does NOT build.
 #
-# GHCR auth model: the controller's `deploy` user only has NOPASSWD sudo for the
-# nuk + install allowlist, NOT `docker login`, so it cannot authenticate to GHCR.
-# Instead the RUNNER user (which can run docker directly) logs in and pulls the
-# images into the SHARED docker daemon; `sudo -u deploy nuk apply` then runs
-# `docker compose up -d` against images already present — no deploy-user auth, and
-# an updated :latest is recreated because its image id changed in the daemon.
+# GHCR auth model: the in-container runner (runs as root, with the host docker
+# socket + /opt/nuklaut bind-mounted) logs in and pulls the images into the SHARED
+# docker daemon, then runs `nuk apply` in-process — no sudo. An updated :latest is
+# recreated because its image id changed in the daemon.
 #
 # Runs on the controller's persistent runner [self-hosted, nuklaut].
 #
@@ -77,9 +75,9 @@ jobs:
       # Images are already in the daemon, so no pull happens as the deploy user.
       - name: nuk apply
         run: |
-          sudo -u deploy /usr/local/bin/nuk apply \
+          /usr/local/bin/nuk apply \
             --repo-path "$GITHUB_WORKSPACE" \
             "${{ inputs.manifest }}"
 
       - name: Show deployment state
-        run: sudo -u deploy /usr/local/bin/nuk list
+        run: /usr/local/bin/nuk list

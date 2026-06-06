@@ -13,6 +13,8 @@
 #   - Per-app env file is at /opt/nuklaut/secrets/<repo>.env (written via SSH manually)
 #   - Org-shared env file is at /opt/nuklaut/secrets/_shared.env (rewritten on every deploy
 #     from org-wide secrets listed below)
+#   - The runner executes in a container as root (RUN_AS_ROOT) with /opt/nuklaut + the
+#     docker socket bind-mounted, so it writes secrets and runs `nuk` directly — no sudo.
 
 name: nuk-deploy (reusable)
 
@@ -81,16 +83,16 @@ jobs:
             OPENAI_API_KEY=${{ secrets.ORG_OPENAI_API_KEY }}
         run: |
           printf '%s\n' "$SHARED_ENV" \
-            | sudo install -m 600 -o deploy -g deploy /dev/stdin /opt/nuklaut/secrets/_shared.env
+            | install -m 600 /dev/stdin /opt/nuklaut/secrets/_shared.env
 
       # --repo-path skips nuk's internal git clone — works for private repos
       # without needing any auth on the controller (the runner already has the
       # checkout via the workflow's automatic GITHUB_TOKEN).
       - name: Apply manifest
         run: |
-          sudo -u deploy /usr/local/bin/nuk apply \
+          /usr/local/bin/nuk apply \
             --repo-path "$GITHUB_WORKSPACE" \
             "${{ inputs.manifest }}"
 
       - name: Show deployment state
-        run: sudo -u deploy /usr/local/bin/nuk list
+        run: /usr/local/bin/nuk list
