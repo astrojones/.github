@@ -10,7 +10,8 @@
 # Conventions enforced by this workflow:
 #   - Image is published to ghcr.io/<owner>/<repo> using built-in GITHUB_TOKEN
 #   - Manifest must exist at .nuklaut/deployment.yml in the caller repo
-#   - Per-app env file is at /opt/nuklaut/secrets/<repo>.env (written via SSH manually)
+#   - Per-app env file is at /opt/nuklaut/secrets/<repo>.env — written by this workflow
+#     from the caller repo's APP_ENV secret (multiline key=value). No SSH needed.
 #   - Org-shared env file is at /opt/nuklaut/secrets/_shared.env (rewritten on every deploy
 #     from org-wide secrets listed below)
 #   - The runner executes in a container as root (RUN_AS_ROOT) with /opt/nuklaut + the
@@ -36,6 +37,13 @@ on:
         required: false
         type: string
         default: .nuklaut/deployment.yml
+    secrets:
+      APP_ENV:
+        description: >
+          Per-app secrets as a multiline key=value env file.
+          Add this as a GitHub repo secret named APP_ENV.
+          Written to /opt/nuklaut/secrets/<repo>.env on every deploy.
+        required: false
 
 permissions:
   contents: read
@@ -71,6 +79,16 @@ jobs:
         env:
           IMG: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
         run: docker push --all-tags "$IMG"
+
+      # Write per-app env file from the APP_ENV repo secret. Creates an empty file if the
+      # secret is absent — nuk still references it via envFrom.secretRef, which is harmless.
+      - name: Write per-app env file
+        env:
+          REPO: ${{ github.event.repository.name }}
+          APP_ENV_CONTENT: ${{ secrets.APP_ENV }}
+        run: |
+          printf '%s\n' "$APP_ENV_CONTENT" \
+            | install -m 600 /dev/stdin "/opt/nuklaut/secrets/${REPO}.env"
 
       # Write the shared env file on every deploy. Add new org-wide secrets here as needed —
       # they must be defined at https://github.com/organizations/<org>/settings/secrets/actions
