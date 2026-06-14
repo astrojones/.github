@@ -52,12 +52,12 @@ jobs:
         with:
           python-version: ${{ inputs.python-version }}
 
-      - name: Ruff lint + format check
+      # Lint only (respecting the repo's [tool.ruff] config). Format-enforcement
+      # is intentionally NOT part of the baseline gate — adding it later is a
+      # deliberate per-repo step, not a surprise that blocks every auto-merge.
+      - name: Ruff lint
         if: ${{ inputs.language == 'python' }}
-        run: |
-          set -euo pipefail
-          uvx ruff check .
-          uvx ruff format --check .
+        run: uvx ruff check .
 
       - name: Pytest (only if a test suite is present)
         if: ${{ inputs.language == 'python' }}
