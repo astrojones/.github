@@ -40,6 +40,15 @@ on:
         description: The tag of the created release (when release_created)
         value: ${{ jobs.release-please.outputs.tag_name }}
 
+# Hands-free releases require a bot identity, not the built-in GITHUB_TOKEN:
+#   * GITHUB_TOKEN-driven pushes/merges don't trigger further workflows (recursion
+#     guard), so a token-merged release PR would never fire the release-creation
+#     run — no tag, no release, no deploy.
+#   * Free-plan private repos also can't use branch protection / native auto-merge.
+# Provide an org secret RELEASE_PLEASE_TOKEN (GitHub App installation token or a
+# PAT) and pass it with `secrets: inherit`; we fall back to GITHUB_TOKEN, which
+# still opens release PRs but leaves the final merge to a human.
+
 permissions:
   contents: write
   pull-requests: write
@@ -54,21 +63,25 @@ jobs:
       - uses: googleapis/release-please-action@v4
         id: rp
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: ${{ inputs.config-file }}
           manifest-file: ${{ inputs.manifest-file }}
 
-      # Set every open release PR to auto-merge so no human merges it. release-please
-      # labels its PRs `autorelease: pending`; auto-merge waits for the required `ci`
-      # check, then squash-merges, which triggers the next run that cuts the release.
-      - name: Auto-merge the release PR
+      # Squash-merge the release PR so no human merges it. The PR is mechanical
+      # (version + CHANGELOG; the source already passed `ci` on the push that
+      # produced it), and Free-plan private repos have no native auto-merge to
+      # lean on — so we merge it directly. When merged with RELEASE_PLEASE_TOKEN
+      # (a bot identity), the merge push triggers the next run that cuts the
+      # tag/release; with the fallback GITHUB_TOKEN the merge still happens but the
+      # release is only cut on the next human push (so provide the token).
+      - name: Merge the release PR
         if: ${{ steps.rp.outputs.prs_created == 'true' }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           for pr in $(gh pr list --state open --label "autorelease: pending" \
                         --json number --jq '.[].number'); do
-            echo "Enabling auto-merge on release PR #${pr}"
-            gh pr merge --auto --squash "$pr"
+            echo "Merging release PR #${pr}"
+            gh pr merge --squash --delete-branch "$pr"
           done
