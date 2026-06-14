@@ -1,0 +1,109 @@
+name: ci (reusable)
+
+# Org-wide minimum CI standard. Each repo calls this on PR + push to main:
+#
+#   name: ci
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main]
+#   jobs:
+#     ci:
+#       uses: astrojones/.github/.github/workflows/ci.yml@main
+#       with:
+#         language: python   # python | node | static
+#
+# It produces a single `ci` job that is meant to be the required status check on
+# main — which both enforces the baseline and makes release-PR auto-merge valid.
+#
+# Philosophy: lint + format + test where they exist, fail loudly on real
+# failures, and stay a trivial green for content-only repos. Steps self-skip
+# when their tooling/config isn't present, so one workflow fits every repo.
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "python | node | static"
+        type: string
+        required: true
+      python-version:
+        type: string
+        required: false
+        default: "3.12"
+      node-version:
+        type: string
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Python: ruff lint + format check, pytest when a suite exists --------
+      - name: Set up uv
+        if: ${{ inputs.language == 'python' }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Ruff lint + format check
+        if: ${{ inputs.language == 'python' }}
+        run: |
+          set -euo pipefail
+          uvx ruff check .
+          uvx ruff format --check .
+
+      - name: Pytest (only if a test suite is present)
+        if: ${{ inputs.language == 'python' }}
+        run: |
+          set -euo pipefail
+          if ls tests/test_*.py tests/*_test.py test_*.py >/dev/null 2>&1; then
+            uv sync --all-extras --dev 2>/dev/null || uv sync 2>/dev/null || true
+            uv run pytest -q
+          else
+            echo "no pytest suite found — skipping"
+          fi
+
+      # ---- Node/TS: install via the detected package manager, run scripts ------
+      - name: Set up Node
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install + lint + build + test
+        if: ${{ inputs.language == 'node' }}
+        run: |
+          set -euo pipefail
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+            pnpm run --if-present lint
+            pnpm run --if-present build
+            pnpm run --if-present test
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --frozen-lockfile
+            yarn run --if-present lint
+            yarn run --if-present build
+            yarn run --if-present test
+          else
+            npm ci || npm install
+            npm run --if-present lint
+            npm run --if-present build
+            npm test --if-present
+          fi
+
+      # ---- Static / content repos: nothing to test, just confirm it's there ----
+      - name: Static check
+        if: ${{ inputs.language == 'static' }}
+        run: |
+          set -euo pipefail
+          test -n "$(ls -A)" || { echo "::error::repository is empty"; exit 1; }
+          echo "static repo — no build/test, ok"

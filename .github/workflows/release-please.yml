@@ -1,0 +1,74 @@
+name: release-please (reusable)
+
+# Org-wide release automation. Each repo calls this on push to main:
+#
+#   jobs:
+#     release:
+#       uses: astrojones/.github/.github/workflows/release-please.yml@main
+#       secrets: inherit
+#
+# Requires per-repo release-please-config.json + .release-please-manifest.json.
+#
+# No manual merge: the release PR is set to auto-merge, so a release cuts itself
+# once the repo's required `ci` check goes green. (auto-merge must be enabled on
+# the repo and `ci` must be a required status check on main — both are part of
+# repo onboarding. Without a required check, --auto is rejected by GitHub.)
+#
+# Token: the built-in GITHUB_TOKEN is sufficient for every repo whose release
+# does NOT drive a tag/`release:published`-triggered workflow. nuk is the lone
+# exception and folds its build into a release_created-gated job in its own
+# caller, reading this workflow's `release_created`/`tag_name` outputs.
+
+on:
+  workflow_call:
+    inputs:
+      config-file:
+        description: Path to the release-please config in the caller repo
+        type: string
+        required: false
+        default: release-please-config.json
+      manifest-file:
+        description: Path to the release-please manifest in the caller repo
+        type: string
+        required: false
+        default: .release-please-manifest.json
+    outputs:
+      release_created:
+        description: "true if a release was created on this run"
+        value: ${{ jobs.release-please.outputs.release_created }}
+      tag_name:
+        description: The tag of the created release (when release_created)
+        value: ${{ jobs.release-please.outputs.tag_name }}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: rp
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: ${{ inputs.config-file }}
+          manifest-file: ${{ inputs.manifest-file }}
+
+      # Set every open release PR to auto-merge so no human merges it. release-please
+      # labels its PRs `autorelease: pending`; auto-merge waits for the required `ci`
+      # check, then squash-merges, which triggers the next run that cuts the release.
+      - name: Auto-merge the release PR
+        if: ${{ steps.rp.outputs.prs_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for pr in $(gh pr list --state open --label "autorelease: pending" \
+                        --json number --jq '.[].number'); do
+            echo "Enabling auto-merge on release PR #${pr}"
+            gh pr merge --auto --squash "$pr"
+          done
