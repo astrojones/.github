@@ -52,18 +52,65 @@ jobs:
   release:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     outputs:
-      released: ${{ steps.rel.outputs.released }}
-      tag: ${{ steps.rel.outputs.tag }}
+      released: ${{ steps.rel.outputs.released || steps.bootstrap.outputs.released }}
+      tag: ${{ steps.rel.outputs.tag || steps.bootstrap.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # full history + tags, so the version can be computed
+
+      # First release for a brand-new repo. github-tag-action can't compute a
+      # delta with no prior tag: the range collapses to HEAD..HEAD, so it reports
+      # "Analysis of 0 commits complete: no release" and nothing ever ships. So
+      # bootstrap directly — tag HEAD at the in-code version (first version-file,
+      # else 0.1.0), push the tag, create the release — and skip computation this
+      # run. No-op once any tag exists (every already-released repo).
+      - name: Bootstrap first release when no tag exists
+        id: bootstrap
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          FILES: ${{ inputs.version-files }}
+        run: |
+          set -euo pipefail
+          if [ -n "$(git tag)" ]; then echo "tags exist; skipping bootstrap"; exit 0; fi
+          version="$(python3 - <<'PY'
+          import os, re, json, pathlib
+          v = ""
+          for f in (l.strip() for l in os.environ.get("FILES", "").splitlines() if l.strip()):
+              p = pathlib.Path(f)
+              if not p.is_file():
+                  continue
+              t = p.read_text()
+              if f.endswith(".json"):
+                  v = str(json.loads(t).get("version", ""))
+              elif f.endswith(".toml"):
+                  m = re.search(r'(?m)^version\s*=\s*"([^"]*)"', t); v = m.group(1) if m else ""
+              else:
+                  m = re.search(r'(?m)^__version__\s*=\s*"([^"]*)"', t); v = m.group(1) if m else ""
+              if v:
+                  break
+          print(v or "0.1.0")
+          PY
+          )"
+          TAG="v${version}"
+          git config user.name "nuklaut-release"
+          git config user.email "release@astrojones.de"
+          git tag "$TAG"
+          git push origin "$TAG"
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/releases" \
+            -d "$(TAG="$TAG" python3 -c 'import json,os; print(json.dumps({"tag_name":os.environ["TAG"],"name":os.environ["TAG"],"generate_release_notes":True}))')"
+          { echo "released=true"; echo "tag=${TAG}"; } >> "$GITHUB_OUTPUT"
 
       # Conventional commits since the last tag -> next semver (dry run: compute
       # only, so we can stamp files and tag the bump commit ourselves). No feat/
       # fix/breaking commit -> empty new_tag -> nothing released.
       - name: Compute next version
         id: ver
+        if: ${{ steps.bootstrap.outputs.released != 'true' }}
         uses: mathieudutour/github-tag-action@v6.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -73,7 +120,7 @@ jobs:
 
       - name: Stamp version, commit to main, tag + release
         id: rel
-        if: ${{ steps.ver.outputs.new_tag != '' }}
+        if: ${{ steps.bootstrap.outputs.released != 'true' && steps.ver.outputs.new_tag != '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -82,7 +129,6 @@ jobs:
           FILES: ${{ inputs.version-files }}
         run: |
           set -euo pipefail
-          staged=""
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             [ -f "$f" ] || { echo "version-file '$f' not present, skipping"; continue; }
@@ -103,12 +149,14 @@ jobs:
               p.write_text(t2)
           PY
             git add -- "$f"
-            staged="yes"
           done <<< "$FILES"
 
           git config user.name "nuklaut-release"
           git config user.email "release@astrojones.de"
-          if [ -n "$staged" ]; then
+          # Only commit if a version-file actually changed. When the computed
+          # version equals what's already in-code (e.g. nothing to bump), there's
+          # no staged diff and `git commit` would fail under `set -e` — guard it.
+          if ! git diff --cached --quiet; then
             git commit -m "chore(release): ${TAG} [skip ci]"
             git push origin HEAD:main
           fi
