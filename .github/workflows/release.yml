@@ -1,24 +1,35 @@
 name: release (reusable, no-PR)
 
-# No-PR release. On push to main, derive the next version from the conventional
-# commits since the last tag, then create the tag + GitHub release. There is no
-# release PR, no auto-merge, no PAT — the version lives in the tag.
+# No-PR release on the self-hosted nuklaut runner. On push to main:
+#   1. derive the next version from conventional commits since the last tag,
+#   2. stamp it into the in-code version files (package.json / *.toml / *.py),
+#   3. commit that straight to main with [skip ci] (no PR),
+#   4. create the tag + GitHub release.
+# No release PR, no auto-merge, no PAT. A GITHUB_TOKEN push to main does not
+# re-trigger workflows (and [skip ci] is belt-and-suspenders), so no loop.
 #
 #   jobs:
 #     release:
 #       uses: astrojones/.github/.github/workflows/release.yml@main
 #       secrets: inherit
+#       with:
+#         version-files: |        # optional; omit for repos with no in-code version
+#           package.json
 #
 # Callers that build/deploy on release add a job gated on the `released` output
-# IN THE SAME RUN — a tag/release created with GITHUB_TOKEN does not trigger
-# tag- or release-triggered workflows (recursion guard), so post-release work
-# must happen here rather than in a separate `on: push: tags` workflow.
+# IN THE SAME RUN (a GITHUB_TOKEN-created tag/release triggers nothing).
 
 on:
   workflow_call:
+    inputs:
+      version-files:
+        description: Newline-separated files to stamp the version into (package.json | *.toml [project].version | *.py __version__).
+        type: string
+        required: false
+        default: ''
     outputs:
       released:
-        description: "true if a new version was tagged + released this run"
+        description: "true if a new version was committed/tagged/released this run"
         value: ${{ jobs.release.outputs.released }}
       tag:
         description: "the new tag (e.g. v1.2.3), empty when nothing was released"
@@ -29,29 +40,77 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nuklaut]
     outputs:
-      released: ${{ steps.tag.outputs.new_tag != '' }}
-      tag: ${{ steps.tag.outputs.new_tag }}
+      released: ${{ steps.rel.outputs.released }}
+      tag: ${{ steps.rel.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # full history + tags, so the version can be computed
 
-      # Conventional commits since the last tag -> next semver. default_bump:false
-      # means a push with no feat/fix/breaking commit produces no tag (new_tag
-      # stays empty), so chore/ci/docs-only pushes don't cut a release.
-      - name: Compute next version + tag
-        id: tag
+      # Conventional commits since the last tag -> next semver (dry run: compute
+      # only, so we can stamp files and tag the bump commit ourselves). No feat/
+      # fix/breaking commit -> empty new_tag -> nothing released.
+      - name: Compute next version
+        id: ver
         uses: mathieudutour/github-tag-action@v6.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           default_bump: false
           release_branches: main
+          dry_run: true
 
-      - name: Create GitHub release
-        if: ${{ steps.tag.outputs.new_tag != '' }}
+      - name: Stamp version, commit to main, tag + release
+        id: rel
+        if: ${{ steps.ver.outputs.new_tag != '' }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.tag.outputs.new_tag }}
-        run: gh release create "$TAG" --title "$TAG" --generate-notes
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.ver.outputs.new_tag }}
+          VERSION: ${{ steps.ver.outputs.new_version }}
+          FILES: ${{ inputs.version-files }}
+        run: |
+          set -euo pipefail
+          staged=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ -f "$f" ] || { echo "version-file '$f' not present, skipping"; continue; }
+            python3 - "$f" "$VERSION" <<'PY'
+          import sys, re, json, pathlib
+          path, v = sys.argv[1], sys.argv[2]
+          p = pathlib.Path(path); t = p.read_text()
+          if path.endswith(".json"):
+              d = json.loads(t); d["version"] = v
+              p.write_text(json.dumps(d, indent=2) + "\n")
+          elif path.endswith(".toml"):
+              t2, n = re.subn(r'(?m)^version\s*=\s*"[^"]*"', f'version = "{v}"', t, count=1)
+              assert n == 1, f"{path}: no '[project] version = \"...\"' line"
+              p.write_text(t2)
+          else:
+              t2, n = re.subn(r'(?m)^(__version__\s*=\s*)"[^"]*"', rf'\g<1>"{v}"', t, count=1)
+              assert n == 1, f"{path}: no '__version__ = \"...\"' line"
+              p.write_text(t2)
+          PY
+            git add -- "$f"
+            staged="yes"
+          done <<< "$FILES"
+
+          git config user.name "nuklaut-release"
+          git config user.email "release@astrojones.de"
+          if [ -n "$staged" ]; then
+            git commit -m "chore(release): ${TAG} [skip ci]"
+            git push origin HEAD:main
+          fi
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          # Create the GitHub release via REST (no dependency on gh being on the
+          # self-hosted runner). generate_release_notes builds notes from history.
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/releases" \
+            -d "$(python3 -c 'import json,os; print(json.dumps({"tag_name":os.environ["TAG"],"name":os.environ["TAG"],"generate_release_notes":True}))')"
+
+          { echo "released=true"; echo "tag=${TAG}"; } >> "$GITHUB_OUTPUT"
