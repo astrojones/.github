@@ -67,28 +67,30 @@ jobs:
           config-file: ${{ inputs.config-file }}
           manifest-file: ${{ inputs.manifest-file }}
 
-      # Squash-merge the release PR so no human merges it. The PR is mechanical
-      # (version + CHANGELOG; the source already passed `ci` on the push that
-      # produced it), and Free-plan private repos have no native auto-merge to
-      # lean on — so we merge it directly. When merged with RELEASE_PLEASE_TOKEN
-      # (a bot identity), the merge push triggers the next run that cuts the
-      # tag/release; with the fallback GITHUB_TOKEN the merge still happens but the
-      # release is only cut on the next human push (so provide the token).
-      # Always run (not gated on prs_created) so a pending release PR is merged
-      # even on a re-run where the action made no change. Match on the head branch
-      # (`release-please--…`), which is set at PR creation — the `autorelease:
-      # pending` label is applied a beat later, so in the creating run a label
-      # filter (or the search-backed `gh pr list --label`) finds nothing. We merge
-      # directly regardless of the PR's own checks (the source already passed `ci`
-      # on the push that produced it, and Free-plan private repos have no required
-      # checks anyway).
+      # Squash-merge the release PR so no human merges it. We merge the PR number
+      # the action just returned (steps.rp.outputs.pr) rather than listing PRs —
+      # listing with the bot token came back empty in practice, and the output is
+      # authoritative and immediate. The PR object JSON is passed via env (never
+      # inlined into the script) so its body can't break parsing or inject.
+      #
+      # The PR is mechanical (version + CHANGELOG; the source already passed `ci`
+      # on the push that produced it), and Free-plan private repos have no required
+      # checks, so we merge directly regardless of the PR's own (possibly
+      # approval-gated) `ci`. When merged with RELEASE_PLEASE_TOKEN (a bot
+      # identity) the merge push triggers the next run that cuts the tag/release;
+      # with the fallback GITHUB_TOKEN the merge still happens but the release is
+      # only cut on the next human push (so provide the token).
       - name: Merge the release PR
+        if: ${{ steps.rp.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          RP_PR: ${{ steps.rp.outputs.pr }}
         run: |
           set -euo pipefail
-          for pr in $(gh pr list --state open --json number,headRefName \
-                        --jq '.[] | select(.headRefName | startswith("release-please--")) | .number'); do
+          pr=$(printf '%s' "$RP_PR" | jq -r '.number // empty')
+          if [ -n "$pr" ]; then
             echo "Merging release PR #${pr}"
             gh pr merge --squash --delete-branch "$pr"
-          done
+          else
+            echo "no release PR number in action output; nothing to merge"
+          fi
