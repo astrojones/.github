@@ -63,7 +63,11 @@ jobs:
         if: ${{ inputs.language == 'python' }}
         run: |
           set -euo pipefail
-          if ls tests/test_*.py tests/*_test.py test_*.py >/dev/null 2>&1; then
+          # Detect a suite robustly: `ls a b c` exits non-zero if ANY glob is
+          # unmatched, so it skipped real suites whenever only one naming
+          # convention was present. compgen -G tests each pattern independently
+          # and is true if any matches.
+          if compgen -G "tests/test_*.py" >/dev/null || compgen -G "tests/*_test.py" >/dev/null || compgen -G "test_*.py" >/dev/null; then
             uv sync --all-extras --dev 2>/dev/null || uv sync 2>/dev/null || true
             uv run pytest -q
           else
