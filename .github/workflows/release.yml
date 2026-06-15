@@ -27,6 +27,16 @@ on:
         type: string
         required: false
         default: ''
+      runs-on:
+        # JSON array of runner labels. Default is the nuklaut self-hosted runner
+        # (no GitHub-hosted minutes on private repos). PUBLIC repos MUST override
+        # to '["ubuntu-latest"]': the self-hosted runner refuses public-repo jobs
+        # (allows_public_repositories=false) — and must, since it mounts
+        # docker.sock + /opt/nuklaut, so a fork PR there could own the controller.
+        # Public repos get unlimited free GitHub-hosted minutes anyway.
+        type: string
+        required: false
+        default: '["self-hosted", "nuklaut"]'
     outputs:
       released:
         description: "true if a new version was committed/tagged/released this run"
@@ -40,7 +50,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: [self-hosted, nuklaut]
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     outputs:
       released: ${{ steps.rel.outputs.released }}
       tag: ${{ steps.rel.outputs.tag }}
