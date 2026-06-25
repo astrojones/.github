@@ -59,7 +59,7 @@ jobs:
       matrix:
         image: ${{ fromJSON(inputs.images) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve lowercase image ref
         id: img

@@ -80,7 +80,7 @@ jobs:
       ipv4: ${{ steps.create.outputs.ipv4 }}
     steps:
       - name: Checkout cloud-init template from ${{ inputs.org }}/.github
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ inputs.org }}/.github
           ref: ${{ inputs.template_ref }}
