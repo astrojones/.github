@@ -55,7 +55,7 @@ jobs:
       released: ${{ steps.rel.outputs.released || steps.bootstrap.outputs.released }}
       tag: ${{ steps.rel.outputs.tag || steps.bootstrap.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0   # full history + tags, so the version can be computed
 
