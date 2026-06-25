@@ -1,16 +1,96 @@
-# astrojones/.github — ephemeral Hetzner CI runners
+# astrojones/.github — org-wide reusable workflows
 
-> **Staging note.** This tree currently lives inside the `nuklaut` repo for review.
-> Its contents map 1:1 to the root of the **public** `astrojones/.github` repo
-> (not yet created/pushed). When published:
->
-> ```
-> .github/workflows/runner-up.yml      -> astrojones/.github/.github/workflows/runner-up.yml
-> .github/workflows/runner-down.yml    -> .../runner-down.yml
-> .github/workflows/runner-sweep.yml   -> .../runner-sweep.yml
-> cloud-init/runner.cloud-init.tpl.yaml-> astrojones/.github/cloud-init/runner.cloud-init.tpl.yaml
-> examples/consumer-e2e.yml            -> (copied INTO a consumer repo, e.g. astrojones/kolbe)
-> ```
+This **is** `astrojones/.github`: the org's single source of truth for reusable
+GitHub Actions workflows. Apps call these with `uses:`; they don't duplicate them.
+It also hosts the ephemeral Hetzner CI-runner system documented further below.
+
+## Reusable workflow catalog
+
+All reusable workflows are called as:
+
+```yaml
+uses: astrojones/.github/.github/workflows/<file>@main
+```
+
+A reusable (`uses:`) job cannot contain `steps:`. Pass secrets with
+`secrets: inherit` unless a workflow declares an explicit `secrets:` block (then
+pass those by name). `GITHUB_TOKEN` is always provided automatically — the
+"(auto)" entries below need no `secrets:` at all.
+
+| Workflow | Kind | Required inputs | Secrets |
+|---|---|---|---|
+| `ci.yml` | reusable | `language` | (none) |
+| `app-ci.yml` | reusable | `images` | `GITHUB_TOKEN` (auto) |
+| `release.yml` | reusable | (none) | `GITHUB_TOKEN` (auto) |
+| `nuk-deploy.yml` | reusable | (none) | `secrets: inherit` — opt. `APP_ENV`, org env |
+| `nuk-apply.yml` | reusable | (none) | `GITHUB_TOKEN` (auto) |
+| `nuk-preview.yml` | reusable | `mode` | `GITHUB_TOKEN` (auto) |
+| `e2e-compose-playwright.yml` | reusable | `runner_label`, `backend_image`, `frontend_image` | `GITHUB_TOKEN` (auto) |
+| `migration-shadow-check.yml` | reusable | `prod_postgres_container`, `backend_image`, `backend_tag`, `critical_tables` | `GITHUB_TOKEN` (auto) |
+| `runner-up.yml` | reusable | (none — all defaulted) | `HCLOUD_TOKEN`, `RUNNER_PAT` |
+| `runner-down.yml` | reusable | `server` | `HCLOUD_TOKEN` |
+| `runner-sweep.yml` | **internal** (scheduled, not `workflow_call`) | (n/a) | `HCLOUD_TOKEN` (org/repo secret) |
+
+Per-workflow contracts (inputs show `name` *(default)*; **bold** = required):
+
+### `ci.yml` — org-wide minimum CI gate
+Lint + format + test where they exist; a trivial green for content-only repos.
+- Inputs: **`language`** (`python` \| `node` \| `static`), `python-version` *(3.12)*, `node-version` *(20)*.
+- Secrets: none. Permissions: `contents: read`.
+
+### `app-ci.yml` — build + push images to GHCR
+Builds a JSON matrix of images, pushes `ghcr.io/<owner>/<repo>/<name>:<sha>` (+`:latest`).
+- Inputs: **`images`** (JSON array of `{name, context, dockerfile?, build_args?, prebuild?}`), `push` *(true)*, `tag_latest` *(true)*, `extra_tags` *('')*.
+- Secrets: `GITHUB_TOKEN` (auto). Needs `packages: write` (granted internally).
+
+### `release.yml` — no-PR conventional-commit release
+Derives the next version, stamps version files, commits to main `[skip ci]`, tags + releases.
+- Inputs: `version-files` *('')*, `runs-on` *(`["self-hosted","nuklaut"]`)* — **public repos MUST override to `["ubuntu-latest"]`**.
+- Outputs: `released` (true/false), `tag`.
+- Secrets: `GITHUB_TOKEN` (auto). Permissions: `contents: write`.
+
+### `nuk-deploy.yml` — build + deploy a single-image app
+Builds the image, writes per-app + org-shared env files, runs `nuk apply` on the controller.
+- Inputs: `dockerfile` *(Dockerfile)*, `build_context` *(.)*, `manifest` *(.nuklaut/deployment.yml)*.
+- Secrets: `secrets: inherit`. Optional repo secret **`APP_ENV`** (multiline `key=value`); reads org-wide `ORG_SENTRY_DSN`, `ORG_OPENAI_API_KEY` into `_shared.env`; `GITHUB_TOKEN` (auto).
+- Runs on `[self-hosted, nuklaut]`.
+
+### `nuk-apply.yml` — deploy-only (images already in GHCR)
+For multi-image stacks built by their own CI. Pulls images into the shared daemon, `nuk apply`. Does NOT build.
+- Inputs: `manifest` *(.nuklaut/deployment.yml)*, `compose_file` *(docker-compose.yml)*.
+- Secrets: `GITHUB_TOKEN` (auto, via `secrets: inherit`). Runs on `[self-hosted, nuklaut]`.
+
+### `nuk-preview.yml` — per-PR ephemeral preview stack
+Routes a preview at `pr-<n>.<base_host>` via Traefik. Three modes via `mode`.
+- Inputs: **`mode`** (`deploy` \| `teardown` \| `cleanup`). For `deploy`/`teardown` also supply `pr_number` + `app` (and `base_host` for `deploy`) — declared optional but validated at runtime. Plus `images` *({})*, `compose_file` *(docker-compose.pr.yml)*, `manifest_template` *('')*, `backend_service` *(backend)*, `backend_port` *(8000)*, `frontend_service` *(frontend)*, `frontend_port` *(80)*, `max_previews` *(2)*, `comment` *(true)*.
+- Secrets: `GITHUB_TOKEN` (auto). Runs on `[self-hosted, nuklaut]`.
+
+### `e2e-compose-playwright.yml` — sharded Playwright E2E on an ephemeral box
+Stands up a compose stack on the fresh box from `runner-up.yml` and runs a sharded Playwright suite.
+- Inputs: **`runner_label`** (from `runner-up` output), **`backend_image`**, **`frontend_image`** (GHCR refs, no tag), `compose_file` *(docker-compose.e2e.yml)*, `image_tag` *(`${{ github.sha }}`)*, `migrate_cmd` *(alembic upgrade head)*, `seed_cmd` *('')*, `health_url` *(http://localhost:8001/health)*, `base_url` *(http://localhost:5174)*, `test_dir` *(frontend)*, `shard_count` *(5)*, `journey_project` *(journey)*, `stories_project` *(stories)*, `test_grep` *('')*.
+- Outputs: `passed`. Secrets: `GITHUB_TOKEN` (auto). Runs on `[self-hosted, <runner_label>]`.
+
+### `migration-shadow-check.yml` — pre-deploy migration safety gate
+Snapshots live prod postgres into a throwaway DB, runs the candidate image's migrations, fails on row loss / orphan FKs.
+- Inputs: **`prod_postgres_container`**, **`backend_image`** (no tag), **`backend_tag`**, **`critical_tables`** (space-separated), `app_db` *(app)*, `db_user` *(postgres)*, `migrate_cmd` *(alembic upgrade head)*, `orphan_check_sql` *('')*.
+- Secrets: `GITHUB_TOKEN` (auto). Runs on `[self-hosted, nuklaut]`.
+
+### `runner-up.yml` — provision a one-shot ephemeral Hetzner runner
+Mints a 1-hour registration token and boots a fresh VM; exposes its unique label.
+- Inputs: all defaulted — see the [full inputs table](#runner-upyml-inputs) below (`org`, `server_type`, `location`, `image`, `runner_image`, `ssh_key`, `firewall`, `cache_volume`, `cache_volume_size`, `template_ref`, `wait_for_runner`).
+- Outputs: `label`, `server`, `ipv4`.
+- Secrets: **`HCLOUD_TOKEN`**, **`RUNNER_PAT`** (both required). Runs on `ubuntu-latest`.
+
+### `runner-down.yml` — delete an ephemeral runner
+Idempotent teardown; any cache volume is preserved. Always call with `if: always()`.
+- Inputs: **`server`** (from `runner-up`'s `server` output).
+- Secrets: **`HCLOUD_TOKEN`** (required). Runs on `ubuntu-latest`.
+
+### `runner-sweep.yml` — hourly orphan-runner backstop *(internal)*
+Not a reusable workflow — runs on `schedule` (`17 * * * *`) and `workflow_dispatch` in this repo. Deletes `role=gha-runner` servers older than `max_age_minutes` *(120)*.
+- Secrets: `HCLOUD_TOKEN` (set as an org secret, or a repo secret on `.github`).
+
+## Ephemeral Hetzner CI runners
 
 One **unified, workload-agnostic** ephemeral runner for the whole org. A consumer
 workflow brings up a fresh Hetzner VM, runs one job on it (any toolchain, via
