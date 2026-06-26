@@ -35,6 +35,25 @@ on:
         type: string
         required: false
         default: "20"
+      # Opt-in strict Python gates. Off by default so the baseline stays a
+      # trivial green for content-only repos; a repo that wants the stricter
+      # gate enables these explicitly (it is the caller's deliberate choice,
+      # not a surprise that blocks every auto-merge).
+      ruff-format:
+        description: "python: enforce `ruff format --check`"
+        type: boolean
+        required: false
+        default: false
+      ty:
+        description: "python: run the `ty` type checker"
+        type: boolean
+        required: false
+        default: false
+      ty-paths:
+        description: "python: paths passed to `ty check`"
+        type: string
+        required: false
+        default: "src"
 
 permissions:
   contents: read
@@ -58,6 +77,23 @@ jobs:
       - name: Ruff lint
         if: ${{ inputs.language == 'python' }}
         run: uvx ruff check .
+
+      # Opt-in (ruff-format: true): enforce formatting as a hard gate.
+      - name: Ruff format check
+        if: ${{ inputs.language == 'python' && inputs.ruff-format }}
+        run: uvx ruff format --check .
+
+      # Opt-in (ty: true): run the `ty` type checker over ty-paths. Needs the
+      # project's deps, so sync first. Path comes via env (never interpolate a
+      # caller input straight into the run line).
+      - name: Ty type check
+        if: ${{ inputs.language == 'python' && inputs.ty }}
+        env:
+          TY_PATHS: ${{ inputs.ty-paths }}
+        run: |
+          set -euo pipefail
+          uv sync --all-extras --dev 2>/dev/null || uv sync 2>/dev/null || true
+          uv run ty check $TY_PATHS
 
       - name: Pytest (only if a test suite is present)
         if: ${{ inputs.language == 'python' }}
