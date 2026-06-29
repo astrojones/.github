@@ -67,7 +67,7 @@ jobs:
       # ---- Python: ruff lint + format check, pytest when a suite exists --------
       - name: Set up uv
         if: ${{ inputs.language == 'python' }}
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@v8.2.0
         with:
           python-version: ${{ inputs.python-version }}
 
