@@ -127,7 +127,7 @@ jobs:
     if: inputs.mode == 'deploy'
     runs-on: [self-hosted, nuklaut]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Validate inputs
         env:
@@ -180,7 +180,7 @@ jobs:
       # Sticky "limit reached" comment, then exit 0 (do NOT fail the run).
       - name: Comment — limit reached
         if: steps.cap.outputs.at_limit == 'true' && inputs.comment
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           PR: ${{ inputs.pr_number }}
           MAX: ${{ inputs.max_previews }}
@@ -316,7 +316,7 @@ jobs:
       # Sticky PR comment with the live URL + test creds (marker-delimited upsert).
       - name: Comment — preview URL
         if: steps.cap.outputs.at_limit != 'true' && inputs.comment
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           PR: ${{ inputs.pr_number }}
           HOST: ${{ steps.manifest.outputs.host }}
@@ -383,7 +383,7 @@ jobs:
 
       - name: Comment — torn down
         if: inputs.comment
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           PR: ${{ inputs.pr_number }}
           MERGED: ${{ github.event.pull_request.merged }}

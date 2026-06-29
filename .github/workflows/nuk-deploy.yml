@@ -53,7 +53,7 @@ jobs:
   build-and-deploy:
     runs-on: [self-hosted, nuklaut]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Verify manifest exists
         run: |
