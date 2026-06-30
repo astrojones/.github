@@ -98,7 +98,7 @@ jobs:
           SHARED_ENV: |
             # Managed by astrojones/.github nuk-deploy.yml. Regenerated on every deploy.
             SENTRY_DSN=${{ secrets.ORG_SENTRY_DSN }}
-            OPENAI_API_KEY=${{ secrets.ORG_OPENAI_API_KEY }}
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
         run: |
           printf '%s\n' "$SHARED_ENV" \
             | install -m 600 /dev/stdin /opt/nuklaut/secrets/_shared.env
