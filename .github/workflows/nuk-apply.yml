@@ -46,9 +46,12 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Verify manifest exists
+        env:
+          MANIFEST: ${{ inputs.manifest }}
         run: |
-          test -f "${{ inputs.manifest }}" \
-            || { echo "::error::manifest ${{ inputs.manifest }} not found in repo"; exit 1; }
+          { [ -f "$MANIFEST" ] || [ -f ".nuklaut/$MANIFEST" ]; } \
+            || { echo "::error::manifest $MANIFEST not found (checked repo root and legacy .nuklaut/)"; exit 1; }
+          [ -f "$MANIFEST" ] || echo "::warning::Using legacy .nuklaut/$MANIFEST — move it to the repo root ($MANIFEST)."
 
       # Login + pull as the RUNNER (no sudo) so private images land in the shared
       # daemon. The deploy user reuses them without needing GHCR creds.
