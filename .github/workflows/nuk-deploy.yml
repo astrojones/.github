@@ -9,7 +9,7 @@
 #
 # Conventions enforced by this workflow:
 #   - Image is published to ghcr.io/<owner>/<repo> using built-in GITHUB_TOKEN
-#   - Manifest must exist at .nuklaut/deployment.yml in the caller repo
+#   - Manifest must exist at deployment.yml (repo root) in the caller repo
 #   - Per-app env file is at /opt/nuklaut/secrets/<repo>.env — written by this workflow
 #     from the caller repo's APP_ENV secret (multiline key=value). No SSH needed.
 #   - Org-shared env file is at /opt/nuklaut/secrets/_shared.env (rewritten on every deploy
@@ -36,7 +36,7 @@ on:
         description: Path to nuk manifest in the caller repo
         required: false
         type: string
-        default: .nuklaut/deployment.yml
+        default: deployment.yml
     secrets:
       APP_ENV:
         description: >

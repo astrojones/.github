@@ -19,7 +19,7 @@ name: nuk-apply
 #       uses: astrojones/.github/.github/workflows/nuk-apply.yml@main
 #       secrets: inherit
 #       with:
-#         manifest: .nuklaut/deployment.yml          # optional (default)
+#         manifest: deployment.yml                   # optional (default; repo root)
 #         compose_file: docker-compose.nuklaut.yml   # optional (default docker-compose.yml)
 
 on:
@@ -29,7 +29,7 @@ on:
         description: Path to the nuk manifest in the caller repo
         type: string
         required: false
-        default: .nuklaut/deployment.yml
+        default: deployment.yml
       compose_file:
         description: Compose file (repo-relative) used to pre-pull images as the runner
         type: string
