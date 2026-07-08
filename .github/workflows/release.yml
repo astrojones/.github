@@ -105,6 +105,49 @@ jobs:
             -d "$(TAG="$TAG" python3 -c 'import json,os; print(json.dumps({"tag_name":os.environ["TAG"],"name":os.environ["TAG"],"generate_release_notes":True}))')"
           { echo "released=true"; echo "tag=${TAG}"; } >> "$GITHUB_OUTPUT"
 
+      # Breaking-change pre-scan. github-tag-action@v6.2 does NOT recognize the
+      # conventional-commit `!` shorthand (feat!/fix!/refactor!) — it parses to no
+      # type and yields "no release", so with default_bump:false a breaking change
+      # silently no-ops. Detect it ourselves (both the `!` shorthand and a
+      # BREAKING CHANGE / BREAKING-CHANGE footer) and force a MAJOR bump; also flag
+      # whether ANY releasing commit (feat/fix/breaking) exists so the guard below
+      # can fail loudly if nothing gets computed.
+      - name: Scan commits for breaking / releasing changes
+        id: scan
+        if: ${{ steps.bootstrap.outputs.released != 'true' }}
+        run: |
+          set -euo pipefail
+          last="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -n "$last" ]; then range="${last}..HEAD"; else range="HEAD"; fi
+          subjects="$(git log --format=%s "$range")"
+          bodies="$(git log --format=%B "$range")"
+
+          breaking=false
+          # `!` breaking shorthand in the type: feat!:  fix(scope)!:  refactor!:
+          if printf '%s\n' "$subjects" | grep -Eq '^[A-Za-z]+(\([^)]*\))?!:'; then breaking=true; fi
+          # BREAKING CHANGE: / BREAKING-CHANGE: footer
+          if printf '%s\n' "$bodies" | grep -Eq '^BREAKING[ -]CHANGE:'; then breaking=true; fi
+
+          releasing=false
+          [ "$breaking" = true ] && releasing=true
+          if printf '%s\n' "$subjects" | grep -Eq '^(feat|fix)(\([^)]*\))?!?:'; then releasing=true; fi
+
+          forced_tag=""; forced_version=""
+          if [ "$breaking" = true ]; then
+            base="${last#v}"; major="${base%%.*}"
+            case "$major" in ''|*[!0-9]*) major=0 ;; esac
+            forced_version="$((major + 1)).0.0"
+            forced_tag="v${forced_version}"
+          fi
+
+          {
+            echo "breaking=${breaking}"
+            echo "releasing=${releasing}"
+            echo "forced_tag=${forced_tag}"
+            echo "forced_version=${forced_version}"
+          } >> "$GITHUB_OUTPUT"
+          echo "scan: last=${last:-<none>} range=${range} breaking=${breaking} releasing=${releasing} forced=${forced_tag:-<none>}"
+
       # Conventional commits since the last tag -> next semver (dry run: compute
       # only, so we can stamp files and tag the bump commit ourselves). No feat/
       # fix/breaking commit -> empty new_tag -> nothing released.
@@ -120,12 +163,14 @@ jobs:
 
       - name: Stamp version, commit to main, tag + release
         id: rel
-        if: ${{ steps.bootstrap.outputs.released != 'true' && steps.ver.outputs.new_tag != '' }}
+        # Breaking -> use the forced MAJOR tag from the pre-scan (github-tag-action
+        # can't compute it); otherwise use the action's feat->minor / fix->patch bump.
+        if: ${{ steps.bootstrap.outputs.released != 'true' && (steps.scan.outputs.breaking == 'true' || steps.ver.outputs.new_tag != '') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ steps.ver.outputs.new_tag }}
-          VERSION: ${{ steps.ver.outputs.new_version }}
+          TAG: ${{ steps.scan.outputs.breaking == 'true' && steps.scan.outputs.forced_tag || steps.ver.outputs.new_tag }}
+          VERSION: ${{ steps.scan.outputs.breaking == 'true' && steps.scan.outputs.forced_version || steps.ver.outputs.new_version }}
           FILES: ${{ inputs.version-files }}
         run: |
           set -euo pipefail
@@ -172,3 +217,12 @@ jobs:
             -d "$(python3 -c 'import json,os; print(json.dumps({"tag_name":os.environ["TAG"],"name":os.environ["TAG"],"generate_release_notes":True}))')"
 
           { echo "released=true"; echo "tag=${TAG}"; } >> "$GITHUB_OUTPUT"
+
+      # Loud guard: if there WERE releasing commits (feat/fix or breaking) since the
+      # last tag but nothing was released this run, fail instead of silently no-oping
+      # (the original bug). Skipped on the bootstrap path and on chore/docs-only runs.
+      - name: Fail if a releasing change did not produce a release
+        if: ${{ steps.bootstrap.outputs.released != 'true' && steps.scan.outputs.releasing == 'true' && steps.rel.outputs.released != 'true' }}
+        run: |
+          echo "::error::Releasing commits (feat/fix or breaking) exist since the last tag, but no version was computed or released. Refusing to succeed silently." >&2
+          exit 1
