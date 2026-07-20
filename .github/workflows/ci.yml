@@ -76,12 +76,14 @@ jobs:
       # deliberate per-repo step, not a surprise that blocks every auto-merge.
       - name: Ruff lint
         if: ${{ inputs.language == 'python' }}
-        run: uvx ruff check .
+        # Pinned to avoid tooling drift (uvx ruff = latest would break green->red
+        # on every new ruff release). Bump deliberately, org-wide.
+        run: uvx ruff@0.15.15 check .
 
       # Opt-in (ruff-format: true): enforce formatting as a hard gate.
       - name: Ruff format check
         if: ${{ inputs.language == 'python' && inputs.ruff-format }}
-        run: uvx ruff format --check .
+        run: uvx ruff@0.15.15 format --check .
 
       # Opt-in (ty: true): run the `ty` type checker over ty-paths. Needs the
       # project's deps, so sync first. Path comes via env (never interpolate a
