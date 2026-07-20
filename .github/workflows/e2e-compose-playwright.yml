@@ -231,7 +231,7 @@ jobs:
       # Playwright runs in HOST context (NOT inside a container) so BASE_URL=
       # localhost:<port> reaches the host-published compose ports.
       - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -444,7 +444,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-results
           path: |
