@@ -50,7 +50,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # self-hosted (private repos: GitHub-hosted burns the 2000 free minutes).
+    runs-on: [self-hosted, nuklaut]
     permissions:
       contents: read
       packages: write

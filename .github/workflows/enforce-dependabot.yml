@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   enforce-dependabot:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nuklaut]
     steps:
       - name: Add dependabot.yml to repos missing it
         env:
