@@ -60,7 +60,8 @@ permissions:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    # self-hosted (private repos: GitHub-hosted burns the 2000 free minutes).
+    runs-on: [self-hosted, nuklaut]
     steps:
       - uses: actions/checkout@v7
 
