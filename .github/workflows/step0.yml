@@ -1,0 +1,99 @@
+name: step0 (reusable)
+
+# Org-wide reusable provisioning engine: render the pinned core's cloud-init from
+# an org manifest and create (or recycle) ONE platform host via infra's step0.sh.
+# Carries NO deployment specifics — a consuming superrepo (e.g. astrocloud) owns the
+# lifecycle dispatch/schedule and calls this via:
+#   uses: astrojones/.github/.github/workflows/step0.yml@main
+#
+# ubuntu-latest is INTENTIONAL: step0 bootstraps the FIRST box, so there is no
+# self-hosted runner yet — chicken/egg.
+#
+# The caller checks out its OWN tree (with the infra submodule) so both step0.sh
+# and the org manifest are present; step0_path/org_file are paths within it.
+
+on:
+  workflow_call:
+    inputs:
+      host:
+        description: "hosts[] entry to provision"
+        type: string
+        required: true
+      org_file:
+        description: "org manifest path within the caller checkout"
+        type: string
+        required: true
+      step0_path:
+        description: "path to step0.sh within the caller checkout"
+        type: string
+        default: infra/step0.sh
+      core_version:
+        description: "nuklaut core git ref"
+        type: string
+        default: main
+      nuk_version:
+        description: "nuk git ref"
+        type: string
+        default: v0.14.0
+      no_wait:
+        description: "skip the runner-registration wait (set true for runners=none)"
+        type: boolean
+        default: false
+      dry_run:
+        description: "render + size-check only, provision nothing"
+        type: boolean
+        default: true
+    secrets:
+      HCLOUD_TOKEN:
+        required: true
+      NUK_DEPLOY_TOKEN:
+        required: true
+      SOPS_AGE_KEY:
+        required: false
+      TAILSCALE_AUTHKEY:
+        required: false
+      RUNNER_PAT:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  step0:
+    runs-on: ubuntu-latest
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      NUK_DEPLOY_TOKEN: ${{ secrets.NUK_DEPLOY_TOKEN }}
+      SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      GH_TOKEN: ${{ secrets.RUNNER_PAT || github.token }}
+      CORE_VERSION: ${{ inputs.core_version }}
+      NUK_VERSION: ${{ inputs.nuk_version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch the infra submodule (private) with the deploy token
+        env:
+          NUK_DEPLOY_TOKEN: ${{ secrets.NUK_DEPLOY_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${NUK_DEPLOY_TOKEN}@github.com/".insteadOf "git@github.com:"
+          git submodule update --init infra
+
+      - name: Install hcloud CLI
+        uses: hetznercloud/setup-hcloud@v2
+
+      - name: Ensure envsubst
+        run: command -v envsubst >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq gettext-base; }
+
+      - name: step0
+        env:
+          HOST: ${{ inputs.host }}
+          ORG_FILE: ${{ inputs.org_file }}
+          STEP0_PATH: ${{ inputs.step0_path }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          NO_WAIT: ${{ inputs.no_wait }}
+        run: |
+          set -- --host "$HOST" --org-file "$ORG_FILE"
+          [ "$DRY_RUN" = "true" ] && set -- "$@" --dry-run
+          [ "$NO_WAIT" = "true" ] && set -- "$@" --no-wait
+          "$STEP0_PATH" "$@"
