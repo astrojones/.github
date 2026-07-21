@@ -41,6 +41,10 @@ on:
         description: "nuk git ref"
         type: string
         default: v0.14.0
+      runner_labels:
+        description: "GH_RUNNER_LABELS for the on-box ephemeral runner — MUST stay disjoint from prod 'nuklaut'"
+        type: string
+        default: nuklaut
       no_wait:
         description: "skip the runner-registration wait (set true for runners=none)"
         type: boolean
@@ -64,6 +68,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       CORE_VERSION: ${{ inputs.core_version }}
       NUK_VERSION: ${{ inputs.nuk_version }}
+      GH_RUNNER_LABELS: ${{ inputs.runner_labels }}
     steps:
       - name: Recover secrets from APP_ENV
         env:
