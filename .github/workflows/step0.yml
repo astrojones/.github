@@ -6,6 +6,12 @@ name: step0 (reusable)
 # lifecycle dispatch/schedule and calls this via:
 #   uses: astrojones/.github/.github/workflows/step0.yml@main
 #
+# SECRETS: this repo (astrojones/.github) is PUBLIC, and GitHub does NOT pass a
+# private caller's ORG secrets to a reusable workflow in a public repo. The caller
+# therefore passes a single REPO secret APP_ENV (repo secrets DO cross) holding the
+# full .env — HCLOUD_TOKEN, NUK_DEPLOY_TOKEN, HETZNER_API_TOKEN, etc. — which the
+# first step unpacks into the job env (masked).
+#
 # ubuntu-latest is INTENTIONAL: step0 bootstraps the FIRST box, so there is no
 # self-hosted runner yet — chicken/egg.
 #
@@ -44,16 +50,9 @@ on:
         type: boolean
         default: true
     secrets:
-      HCLOUD_TOKEN:
+      APP_ENV:
+        description: "full .env (repo secret) — HCLOUD_TOKEN, NUK_DEPLOY_TOKEN, HETZNER_API_TOKEN, ..."
         required: true
-      NUK_DEPLOY_TOKEN:
-        required: true
-      SOPS_AGE_KEY:
-        required: false
-      TAILSCALE_AUTHKEY:
-        required: false
-      RUNNER_PAT:
-        required: false
 
 permissions:
   contents: read
@@ -62,19 +61,27 @@ jobs:
   step0:
     runs-on: ubuntu-latest
     env:
-      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-      NUK_DEPLOY_TOKEN: ${{ secrets.NUK_DEPLOY_TOKEN }}
-      SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
-      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-      GH_TOKEN: ${{ secrets.RUNNER_PAT || github.token }}
+      GH_TOKEN: ${{ github.token }}
       CORE_VERSION: ${{ inputs.core_version }}
       NUK_VERSION: ${{ inputs.nuk_version }}
     steps:
+      - name: Recover secrets from APP_ENV
+        env:
+          APP_ENV: ${{ secrets.APP_ENV }}
+        run: |
+          # Unpack the bundled .env into the job env (masked). One KEY=VALUE per line.
+          while IFS= read -r line; do
+            case "$line" in ''|\#*) continue ;; esac
+            key=${line%%=*}; val=${line#*=}
+            val=${val%\"}; val=${val#\"}; val=${val%\'}; val=${val#\'}
+            [ -n "$key" ] || continue
+            echo "::add-mask::$val"
+            printf '%s=%s\n' "$key" "$val" >> "$GITHUB_ENV"
+          done <<< "$APP_ENV"
+
       - uses: actions/checkout@v7
 
       - name: Fetch the infra submodule (private) with the deploy token
-        env:
-          NUK_DEPLOY_TOKEN: ${{ secrets.NUK_DEPLOY_TOKEN }}
         run: |
           git config --global url."https://x-access-token:${NUK_DEPLOY_TOKEN}@github.com/".insteadOf "git@github.com:"
           git submodule update --init infra
