@@ -107,9 +107,9 @@ jobs:
 
       # Derive the next version from conventional commits since the last tag.
       # Breaking changes (`!` shorthand feat!/fix!/refactor! AND a BREAKING CHANGE /
-      # BREAKING-CHANGE footer) force a MAJOR bump; feat -> minor and fix -> patch
-      # are computed below. Also flag whether ANY releasing commit (feat/fix/
-      # breaking) exists so the guard below can fail loudly if nothing gets computed.
+      # BREAKING-CHANGE footer) force a MAJOR bump; feat -> minor and fix/perf/revert
+      # -> patch are computed below. Also flag whether ANY releasing commit exists so
+      # the guard below can fail loudly if nothing gets computed.
       - name: Scan commits + compute next version
         id: scan
         if: ${{ steps.bootstrap.outputs.released != 'true' }}
@@ -126,9 +126,22 @@ jobs:
           # BREAKING CHANGE: / BREAKING-CHANGE: footer
           if printf '%s\n' "$bodies" | grep -Eq '^BREAKING[ -]CHANGE:'; then breaking=true; fi
 
+          # Conventional-commit types since the last tag. Mirrors the
+          # @semantic-release/commit-analyzer defaults github-tag-action shipped:
+          # feat -> minor; fix / perf / revert -> patch. `revert` counts both the
+          # conventional `revert:` type and git's default `Revert "..."` subject
+          # paired with a `This reverts commit <sha>.` body line.
+          has_feat=false;   printf '%s\n' "$subjects" | grep -Eq '^feat(\([^)]*\))?:'   && has_feat=true
+          has_fix=false;    printf '%s\n' "$subjects" | grep -Eq '^fix(\([^)]*\))?:'    && has_fix=true
+          has_perf=false;   printf '%s\n' "$subjects" | grep -Eq '^perf(\([^)]*\))?:'   && has_perf=true
+          has_revert=false; printf '%s\n' "$subjects" | grep -Eq '^revert(\([^)]*\))?:' && has_revert=true
+          if printf '%s\n' "$subjects" | grep -Eq '^Revert "' \
+             && printf '%s\n' "$bodies" | grep -Eq '^This reverts commit '; then has_revert=true; fi
+
+          # Any releasing commit (major/minor/patch-worthy)? Drives the loud guard.
           releasing=false
-          [ "$breaking" = true ] && releasing=true
-          if printf '%s\n' "$subjects" | grep -Eq '^(feat|fix)(\([^)]*\))?!?:'; then releasing=true; fi
+          if [ "$breaking" = true ] || [ "$has_feat" = true ] || [ "$has_fix" = true ] \
+             || [ "$has_perf" = true ] || [ "$has_revert" = true ]; then releasing=true; fi
 
           forced_tag=""; forced_version=""
           if [ "$breaking" = true ]; then
@@ -138,24 +151,21 @@ jobs:
             forced_tag="v${forced_version}"
           fi
 
-          # Next version (replaces github-tag-action dry-run with default_bump:false).
-          # feat -> minor, fix -> patch, breaking -> major (from forced_version above);
-          # anything else -> empty -> no release. new_tag/new_version are the single
-          # source of truth the `rel` step consumes.
-          has_feat=false; printf '%s\n' "$subjects" | grep -Eq '^feat(\([^)]*\))?:' && has_feat=true
-          has_fix=false;  printf '%s\n' "$subjects" | grep -Eq '^fix(\([^)]*\))?:'  && has_fix=true
-
+          # Next version (replaces the github-tag-action dry run): breaking -> major
+          # (forced_version above), feat -> minor, fix/perf/revert -> patch, else
+          # empty -> no release. Highest bump wins. new_tag/new_version are the
+          # single source of truth the `rel` step consumes.
           new_version=""; new_tag=""
           base="${last#v}"; IFS=. read -r MA MI PA <<< "${base:-0.0.0}"
           case "$MA" in ''|*[!0-9]*) MA=0 ;; esac
           case "$MI" in ''|*[!0-9]*) MI=0 ;; esac
           case "$PA" in ''|*[!0-9]*) PA=0 ;; esac
           if [ "$breaking" = true ]; then
-            new_version="$forced_version"            # major
+            new_version="$forced_version"                                              # major
           elif [ "$has_feat" = true ]; then
-            new_version="${MA}.$((MI + 1)).0"        # minor
-          elif [ "$has_fix" = true ]; then
-            new_version="${MA}.${MI}.$((PA + 1))"    # patch
+            new_version="${MA}.$((MI + 1)).0"                                          # minor
+          elif [ "$has_fix" = true ] || [ "$has_perf" = true ] || [ "$has_revert" = true ]; then
+            new_version="${MA}.${MI}.$((PA + 1))"                                      # patch
           fi
           [ -n "$new_version" ] && new_tag="v${new_version}"
 
