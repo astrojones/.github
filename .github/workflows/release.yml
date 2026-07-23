@@ -59,12 +59,12 @@ jobs:
         with:
           fetch-depth: 0   # full history + tags, so the version can be computed
 
-      # First release for a brand-new repo. github-tag-action can't compute a
-      # delta with no prior tag: the range collapses to HEAD..HEAD, so it reports
-      # "Analysis of 0 commits complete: no release" and nothing ever ships. So
-      # bootstrap directly — tag HEAD at the in-code version (first version-file,
-      # else 0.1.0), push the tag, create the release — and skip computation this
-      # run. No-op once any tag exists (every already-released repo).
+      # First release for a brand-new repo. With no prior tag there's no delta to
+      # analyze, and a fresh repo should be tagged at its in-code version rather
+      # than a commit-derived bump. So bootstrap directly — tag HEAD at the in-code
+      # version (first version-file, else 0.1.0), push the tag, create the release —
+      # and skip computation this run. No-op once any tag exists (every
+      # already-released repo).
       - name: Bootstrap first release when no tag exists
         id: bootstrap
         env:
@@ -105,14 +105,12 @@ jobs:
             -d "$(TAG="$TAG" python3 -c 'import json,os; print(json.dumps({"tag_name":os.environ["TAG"],"name":os.environ["TAG"],"generate_release_notes":True}))')"
           { echo "released=true"; echo "tag=${TAG}"; } >> "$GITHUB_OUTPUT"
 
-      # Breaking-change pre-scan. github-tag-action@v6.2 does NOT recognize the
-      # conventional-commit `!` shorthand (feat!/fix!/refactor!) — it parses to no
-      # type and yields "no release", so with default_bump:false a breaking change
-      # silently no-ops. Detect it ourselves (both the `!` shorthand and a
-      # BREAKING CHANGE / BREAKING-CHANGE footer) and force a MAJOR bump; also flag
-      # whether ANY releasing commit (feat/fix/breaking) exists so the guard below
-      # can fail loudly if nothing gets computed.
-      - name: Scan commits for breaking / releasing changes
+      # Derive the next version from conventional commits since the last tag.
+      # Breaking changes (`!` shorthand feat!/fix!/refactor! AND a BREAKING CHANGE /
+      # BREAKING-CHANGE footer) force a MAJOR bump; feat -> minor and fix -> patch
+      # are computed below. Also flag whether ANY releasing commit (feat/fix/
+      # breaking) exists so the guard below can fail loudly if nothing gets computed.
+      - name: Scan commits + compute next version
         id: scan
         if: ${{ steps.bootstrap.outputs.released != 'true' }}
         run: |
@@ -140,37 +138,47 @@ jobs:
             forced_tag="v${forced_version}"
           fi
 
+          # Next version (replaces github-tag-action dry-run with default_bump:false).
+          # feat -> minor, fix -> patch, breaking -> major (from forced_version above);
+          # anything else -> empty -> no release. new_tag/new_version are the single
+          # source of truth the `rel` step consumes.
+          has_feat=false; printf '%s\n' "$subjects" | grep -Eq '^feat(\([^)]*\))?:' && has_feat=true
+          has_fix=false;  printf '%s\n' "$subjects" | grep -Eq '^fix(\([^)]*\))?:'  && has_fix=true
+
+          new_version=""; new_tag=""
+          base="${last#v}"; IFS=. read -r MA MI PA <<< "${base:-0.0.0}"
+          case "$MA" in ''|*[!0-9]*) MA=0 ;; esac
+          case "$MI" in ''|*[!0-9]*) MI=0 ;; esac
+          case "$PA" in ''|*[!0-9]*) PA=0 ;; esac
+          if [ "$breaking" = true ]; then
+            new_version="$forced_version"            # major
+          elif [ "$has_feat" = true ]; then
+            new_version="${MA}.$((MI + 1)).0"        # minor
+          elif [ "$has_fix" = true ]; then
+            new_version="${MA}.${MI}.$((PA + 1))"    # patch
+          fi
+          [ -n "$new_version" ] && new_tag="v${new_version}"
+
           {
             echo "breaking=${breaking}"
             echo "releasing=${releasing}"
             echo "forced_tag=${forced_tag}"
             echo "forced_version=${forced_version}"
+            echo "new_version=${new_version}"
+            echo "new_tag=${new_tag}"
           } >> "$GITHUB_OUTPUT"
-          echo "scan: last=${last:-<none>} range=${range} breaking=${breaking} releasing=${releasing} forced=${forced_tag:-<none>}"
-
-      # Conventional commits since the last tag -> next semver (dry run: compute
-      # only, so we can stamp files and tag the bump commit ourselves). No feat/
-      # fix/breaking commit -> empty new_tag -> nothing released.
-      - name: Compute next version
-        id: ver
-        if: ${{ steps.bootstrap.outputs.released != 'true' }}
-        uses: mathieudutour/github-tag-action@v6.2
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          default_bump: false
-          release_branches: main
-          dry_run: true
+          echo "scan: last=${last:-<none>} range=${range} breaking=${breaking} releasing=${releasing} new=${new_tag:-<none>}"
 
       - name: Stamp version, commit to main, tag + release
         id: rel
-        # Breaking -> use the forced MAJOR tag from the pre-scan (github-tag-action
-        # can't compute it); otherwise use the action's feat->minor / fix->patch bump.
-        if: ${{ steps.bootstrap.outputs.released != 'true' && (steps.scan.outputs.breaking == 'true' || steps.ver.outputs.new_tag != '') }}
+        # scan computed the next version inline (feat->minor / fix->patch, and the
+        # forced MAJOR for a breaking change). Empty new_tag => nothing to release.
+        if: ${{ steps.bootstrap.outputs.released != 'true' && steps.scan.outputs.new_tag != '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ steps.scan.outputs.breaking == 'true' && steps.scan.outputs.forced_tag || steps.ver.outputs.new_tag }}
-          VERSION: ${{ steps.scan.outputs.breaking == 'true' && steps.scan.outputs.forced_version || steps.ver.outputs.new_version }}
+          TAG: ${{ steps.scan.outputs.new_tag }}
+          VERSION: ${{ steps.scan.outputs.new_version }}
           FILES: ${{ inputs.version-files }}
         run: |
           set -euo pipefail
