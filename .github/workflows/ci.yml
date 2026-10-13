@@ -34,7 +34,7 @@ on:
       node-version:
         type: string
         required: false
-        default: "20"
+        default: "24"
       # Opt-in strict Python gates. Off by default so the baseline stays a
       # trivial green for content-only repos; a repo that wants the stricter
       # gate enables these explicitly (it is the caller's deliberate choice,

@@ -35,7 +35,7 @@ Per-workflow contracts (inputs show `name` *(default)*; **bold** = required):
 
 ### `ci.yml` — org-wide minimum CI gate
 Lint + format + test where they exist; a trivial green for content-only repos.
-- Inputs: **`language`** (`python` \| `node` \| `static`), `python-version` *(3.12)*, `node-version` *(20)*.
+- Inputs: **`language`** (`python` \| `node` \| `static`), `python-version` *(3.12)*, `node-version` *(24)*.
 - Secrets: none. Permissions: `contents: read`.
 
 ### `app-ci.yml` — build + push images to GHCR
