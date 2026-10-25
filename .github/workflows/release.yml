@@ -23,7 +23,7 @@ on:
   workflow_call:
     inputs:
       version-files:
-        description: Newline-separated files to stamp the version into (package.json | *.toml [project].version | *.py __version__).
+        description: Newline-separated files to stamp the version into (package.json | *.toml [project].version | *.py __version__). A pyproject.toml also stamps the root package in a sibling uv.lock.
         type: string
         required: false
         default: ''
@@ -206,12 +206,27 @@ jobs:
               t2, n = re.subn(r'(?m)^version\s*=\s*"[^"]*"', f'version = "{v}"', t, count=1)
               assert n == 1, f"{path}: no '[project] version = \"...\"' line"
               p.write_text(t2)
+              # uv records the root package's version in uv.lock, so bumping only
+              # pyproject.toml breaks every `uv sync --locked` (CI, Dockerfile).
+              # Patch the root entry in place: stdlib only, no uv on the runner.
+              lock = p.with_name("uv.lock")
+              if p.name == "pyproject.toml" and lock.is_file():
+                  m = re.search(r'(?m)^name\s*=\s*"([^"]*)"', t)
+                  assert m, f"{path}: no '[project] name = \"...\"' line"
+                  name = re.sub(r"[-_.]+", "-", m.group(1)).lower()
+                  lt, n = re.subn(
+                      rf'(?m)^(\[\[package\]\]\nname = "{re.escape(name)}"\nversion = )"[^"]*"(\nsource = \{{ (?:editable|virtual) = "\." \}})',
+                      rf'\g<1>"{v}"\g<2>', lock.read_text(), count=1)
+                  assert n == 1, f"{lock}: no root package entry for '{name}'"
+                  lock.write_text(lt)
           else:
               t2, n = re.subn(r'(?m)^(__version__\s*=\s*)"[^"]*"', rf'\g<1>"{v}"', t, count=1)
               assert n == 1, f"{path}: no '__version__ = \"...\"' line"
               p.write_text(t2)
           PY
             git add -- "$f"
+            lock="$(dirname -- "$f")/uv.lock"
+            if [ "$(basename -- "$f")" = pyproject.toml ] && [ -f "$lock" ]; then git add -- "$lock"; fi
           done <<< "$FILES"
 
           git config user.name "nuklaut-release"
